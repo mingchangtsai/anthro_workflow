@@ -1,0 +1,260 @@
+---
+title: |
+  \begin{minipage}{0.2\textwidth}
+    \includegraphics[width=1.5in]{CSIP_logo.jpg}
+  \end{minipage}
+  \begin{minipage}{0.75\textwidth}
+    Anthropometry Testing Report
+  \end{minipage}
+# author: "Vanessa Zoras"
+# date: "2023-10-19"
+geometry: "left=2cm,right=2cm,top=1cm,bottom=2cm"
+classoption: landscape
+output: pdf_document
+header-includes:
+  - \usepackage{titlesec}
+  - \titlespacing{\section}{0pt}{\parskip}{-\parskip}
+---
+```{r include = FALSE}
+# run processing code
+library(pacman)
+p_load(tidyverse,knitr,kableExtra,gridExtra,conflicted)
+suppressMessages(conflict_prefer("filter","dplyr"))
+theme_set(theme_bw())
+options(knitr.kable.NA = '')
+
+# Add Diff values
+if(nrow(AthleteData)>=2){
+  DiffValues <- AthleteData %>% 
+    select(-AthleteName,-reporter) %>% 
+    mutate(across(-Date, ~ . - lead(.))) %>% 
+    slice(-n()) %>% 
+    pivot_longer(2:ncol(.))
+}
+
+#calculate TEM (saved as swc - lazy)
+if(nrow(AthleteData)>=3){
+  swc <- DiffValues %>% 
+    group_by(name) %>% 
+    summarise(value=sd(value,na.rm=T)/sqrt(2))
+  
+  asterisk <- DiffValues %>% 
+    left_join(swc,by="name") %>% 
+    mutate(value=ifelse(abs(value.x)>=value.y,"*","")) %>% 
+    select(Date,name,value)
+  
+} else {
+  swc <- data.frame(Date=Date(), name=character(), value=numeric())
+  asterisk <- data.frame(Date=Date(), name=character(), value=numeric())
+}
+
+```
+# Athlete Name: `r unique(AthleteData$AthleteName)`
+\vspace{0.5cm}
+
+# Testing Data Overview:
+```{r echo=FALSE, results='asis', message=FALSE, warning=FALSE}
+out <- AthleteData %>% select(1,4:6)
+
+# print table
+kable(out, row.names = FALSE, align = "c",
+      col.names = c("Date of Measurement","Weight (kg)","Lean Mass Index (LMI)","Sum of 8 Skinfolds (SO8)")) %>%
+  kable_styling(full_width = FALSE, latex_options = c("HOLD_position", "scale_down"), font_size = 10, position = "center") %>%
+  row_spec(1, bold = TRUE, color = "blue", font_size = 12) %>%
+  row_spec(0, bold = TRUE, background = "gray", color = "white", font_size = 12)
+```
+- Weight is impacted by several factors including: time of day, the scale you use, what you ate before the test, hydration status, menstruation, and creatine supplementation.
+- Lean Mass Index (LMI) tracks changes in body mass that is not associated with changes in skinfolds. Higher LMI equates to a relative increase in muscle mass.
+
+### \hfill Report Created By: `r AthleteData$reporter[1]`
+
+## Testing Data Graphs:
+```{r echo=FALSE, message=FALSE, warning=FALSE, fig.width=15, fig.height=6}
+if(nrow(AthleteData)>=2){
+  out2 <- DiffValues %>% 
+    filter(name %in% c("Weight","lmi","so8")) %>% 
+    left_join(out %>% pivot_longer(Weight:so8,values_to = "value2"), by=c("name","Date"))
+} else {
+  out2 <- DiffValues[0,]
+}
+
+varname <- data.frame(
+  name=c("Weight","lmi","so8"),
+  formal=c("Change in Weight (kg)", "Change in LMI","Change in SO8 Skinfolds (mm)"),
+  formal2=c("Weight","LMI","SO8"),
+  recom=c("weight","LMI","skinfold"),
+  unit=c("kg","of a unit","mm"))
+
+
+plots <- list()
+SummaryDataTable <- data.frame()
+if(nrow(AthleteData)==1){
+  out2 <- AthleteData %>% 
+    select(Date,Weight:so8) %>% 
+    pivot_longer(2:ncol(.))
+  
+  for(k in 1:nrow(varname)){
+    plot_data <- out2[k,] %>% 
+      mutate(value=round(value,2))
+    
+    if(is.na(plot_data$value)){
+      p <- ggplot() +
+        labs(y = varname$formal[k], x="")
+    } else {
+      p <- ggplot(plot_data, aes(x = Date, y = value)) +
+        geom_point() +
+        labs(y = varname$formal[k], x="")
+    }
+    plots[[k]] <- p
+    
+    # summary
+    SummaryDataTable <- data.frame(Metrics=varname$formal2, Notes="")
+  }
+} else {
+  for(k in 1:nrow(varname)){
+    plot_data <- out2 %>% 
+      filter(name==varname$name[k]) %>% 
+      left_join(.,asterisk,by=c("Date","name")) %>% 
+      rename(value=value.x,asterisk=value.y) %>% 
+      mutate(asterisk=as.character(asterisk)) %>% 
+      replace_na(list(asterisk=""))
+    
+    if(nrow(plot_data)>0){
+      p <- ggplot(plot_data, aes(x = Date, y = value)) +
+        # geom_bar(stat = "identity") +
+        geom_point() +
+        geom_line() +
+        annotate('rect', xmin= first(DiffValues$Date), xmax= last(DiffValues$Date), ymin= -swc$value[swc$name==varname$name[k]], ymax= swc$value[swc$name==varname$name[k]], alpha=.2, fill='blue') +
+        geom_text(aes(label = value2),
+                  vjust = ifelse(plot_data$value[plot_data$name==varname$name[k]] > 0, -1.5, 1.5),
+                  size = 3, color = "black", position = position_identity()) +
+        labs(y = varname$formal[k], x="") +
+        theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+        coord_cartesian(ylim=c(min(DiffValues$value[DiffValues$name==varname$name[k]])*0.9, max(DiffValues$value[DiffValues$name==varname$name[k]])*1.1))
+    } else {
+      p <- ggplot() +
+        labs(y = varname$formal[k], x="")
+    }
+    plots[[k]] <- p
+    
+    # summary
+    if(is.na(plot_data$value[plot_data$name==varname$name[k]][1])){
+      StatementFull <- ""
+    } else {
+      Statement <- str_c("Your",varname$recom[k],"has changed by",  round(plot_data$value[plot_data$name==varname$name[k]][1],2),varname$unit[k],"since your last measurement.", sep = " ")
+      
+      if(plot_data$asterisk[plot_data$name==varname$name[k]][1]=="*"){
+        StatementFull <- paste(Statement, "This is a meaningful change.")
+      } else {
+        StatementFull <- paste(Statement, "This is below the threshold to deem it a meaningful change.")
+      }
+    }
+    
+    SummaryDataTable <- bind_rows(SummaryDataTable, data.frame(Metrics=varname$formal2[k], Notes=StatementFull))
+  }
+}
+
+
+grid.arrange(grobs=plots, ncol = 3,
+             bottom = "Date of Measurement",
+             top = "Sumary Graphs - Change Between Measures")
+```
+The shaded region indicates the smallest worthwhile change in measurement. In other words, any bar that extends beyond the shaded region indicates a meaningful change since the last measure. Any bar within the shaded region indicates a change that is not meaningful.
+
+## Summary:
+This is a high-level summary of your current measurement and how it relates to your previous measurement. Please reach out to your support team if you have any questions. **Meaningful change is defined using Cohen's d of >0.2.
+
+```{r echo=FALSE, results='asis', message=FALSE, warning=FALSE}
+# comment
+StatementFull <- "[comment insert]"
+SummaryDataTable <- bind_rows(SummaryDataTable, data.frame(Metrics="Comments", Notes=StatementFull))
+
+kable(SummaryDataTable) %>%
+  kable_styling(full_width = FALSE, latex_options = c("HOLD_position", "scale_down"), position = "left") %>%
+  row_spec(0, background = "gray", color = "white") %>%
+  column_spec(2, width = "21cm")
+```
+
+## Additional Graphs - Girths:
+
+```{r echo=FALSE, message=FALSE, warning=FALSE, fig.height= 8, fig.width=11}
+out <- AthleteData %>% 
+  select(-c(AthleteName:so8)) %>% 
+  pivot_longer(2:ncol(.))
+
+varname <- data.frame(
+  name=unique(out$name),
+  formal=c("R Calf Girth (cm)", "R Relaxed Bicep Girth (cm)", "L Relaxed Bicep Girth (cm)", "R Flexed Bicep Girth (cm)", "L Flexed Bicep Girth (cm)", "Waist Girth (cm)", "Hip Girth (cm)", "R Thigh Girth (cm)", "L Thigh Girth (cm)", "L Calf Girth (cm)"))
+
+if(nrow(AthleteData)>=3){
+  asterisk <- DiffValues %>% 
+    left_join(swc,by="name") %>% 
+    mutate(value=ifelse(abs(value.x)>=value.y,"*","")) %>% 
+    select(Date,name,value)
+} else {
+  asterisk <- DiffValues[0,]
+}
+
+plots <- list()
+if(nrow(AthleteData)==1){
+  for(k in 1:nrow(varname)){
+    plot_data <- out %>% 
+      filter(name==varname$name[k]) %>% 
+      mutate(Date=as.character(Date))
+    
+    if(is.na(plot_data$value)){
+      p <- ggplot() +
+        labs(y = varname$formal[k], x="")
+    } else {
+      p <- ggplot(plot_data, aes(x = Date, y = value)) +
+        geom_point() +
+        labs(y = varname$formal[k], x="")
+    }
+    plots[[k]] <- p
+  }
+} else {
+  for(k in 1:nrow(varname)){
+    if(nrow(AthleteData)==2){
+      plot_data <- out %>% 
+        filter(name==varname$name[k]) %>% 
+        mutate(Date=as.character(Date),
+               asterisk="")
+    } else {
+      plot_data <- out %>% 
+        filter(name==varname$name[k]) %>% 
+        left_join(.,asterisk,by=c("Date","name")) %>% 
+        rename(value=3,asterisk=4) %>% 
+        replace_na(list(asterisk="")) %>% 
+        mutate(Date=as.character(Date))
+    }
+    
+    if(nrow(plot_data)>0){
+      p <- ggplot(plot_data, aes(x = Date, y = value)) +
+        geom_bar(stat = "identity") +
+        geom_text(aes(label = asterisk), vjust = -0.5) +
+        # for numeric dates
+        # geom_text(aes(label = value), hjust = 1.5, angle = 90, size = 3, color = "white") +
+        geom_text(aes(label = value), vjust = 1.5, size = 3, color = "white") +
+        labs(y = varname$formal[k], x="") +
+        theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+        coord_cartesian(ylim = c(0, max(plot_data$value, na.rm = T) * 1.25)) 
+      
+      # for numeric dates
+      # +
+      #   scale_x_date(breaks = plot_data$Date, date_labels = "%Y-%m-%d")
+    } else {
+      p <- ggplot() +
+        labs(y = varname$formal[k], x="")
+    }
+    plots[[k]] <- p
+  }
+}
+
+
+grid.arrange(grobs=plots[c(6:7,9,8,10,1)], ncol = 2)  # You can adjust the layout as needed
+```
+
+```{r echo=FALSE, message=FALSE, warning=FALSE, fig.height= 8, fig.width=11, out.width="100%"}
+grid.arrange(grobs=plots[c(3,2,5,4)], ncol = 2)  # You can adjust the layout as needed
+```
+
