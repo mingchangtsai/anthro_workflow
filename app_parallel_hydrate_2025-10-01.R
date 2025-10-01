@@ -18,8 +18,8 @@ library(readr)
 library(stringr)
 library(rmarkdown)   # for rendering PDF reports
 library(cachem)      # cache for session fetches during hydrate
-# library(future)
-# library(future.apply)
+library(future)
+library(future.apply)
 
 # ================== API CONFIG ==================
 API_URL <- "https://script.google.com/macros/s/AKfycbxPfNlemEphi3kKsT_A9tDw3PLapodl73vfCGLp05bnvLwmGsPCJkARZhvGQSdt4MkB/exec"
@@ -492,16 +492,6 @@ server <- function(input, output, session) {
     d
   }
   
-  # Choose output format (PDF when TeX available; HTML fallback on Connect)
-  choose_output_format <- function() {
-    if (requireNamespace("tinytex", quietly = TRUE)) {
-      ok <- FALSE
-      try({ ok <- tinytex::is_tinytex() || tinytex::is_tlmgr_ready() }, silent = TRUE)
-      if (isTRUE(ok)) return("pdf_document")
-    }
-    "html_document"
-  }
-  
   # helper to make a cache-safe key
   cache_key <- function(ath, d) {
     a <- tolower(gsub("[^a-z0-9]+", "", ath))
@@ -513,67 +503,46 @@ server <- function(input, output, session) {
     withProgress(message = "Downloading database…", value = 0, {
       incProgress(0.1, detail = "Fetching index")
       idx <- fetch_recent(limit)
-      idx <- normalize_cols(idx)
+      .IDX(idx)  # <- store for debug + UI fallbacks
       
-      # If the index has the two key columns, push it into the cache immediately
-      # so Recent/Report can render even if enrichment fails.
-      if (is.data.frame(idx) && nrow(idx) > 0 && all(c("athlete","date") %in% names(idx))) {
-        # Keep only distinct pairs to keep cache light
-        .DB(idx %>% dplyr::distinct(athlete, date))
-        .DB_meta(list(last_loaded = Sys.time()))
-      } else {
-        .DB(tibble::tibble())
-        .DB_meta(list(last_loaded = Sys.time()))
-        showNotification("Index from API didn’t include 'athlete' and 'date' (or was empty).", type = "error", duration = 6)
-        return(invisible(NULL))  # no index → nothing more to do
-      }
-      
-      # Try to enrich with full rows (sequential, no future)
-      incProgress(0.2, detail = "Fetching session rows")
-      
-      pairs <- idx %>%
-        dplyr::distinct(athlete, date) %>%
-        dplyr::arrange(dplyr::desc(date))
-      
-      n <- nrow(pairs)
-      if (n == 0) {
-        incProgress(1, detail = "Done")
+      if (nrow(idx) == 0 || !all(c("athlete","date") %in% names(idx))) {
+        .DB(tibble()); .DB_meta(list(last_loaded = Sys.time()))
+        showNotification("Index from API did not include 'athlete' and 'date'.", type = "error", duration = 6)
         return(invisible(NULL))
       }
       
-      rows <- vector("list", n)
-      fetched <- 0
+      # distinct pairs, newest first
+      pairs <- idx %>% dplyr::distinct(athlete, date) %>% dplyr::arrange(dplyr::desc(date))
+      n <- nrow(pairs)
       
-      # chunking just to show progress nicely
-      chunks <- split(seq_len(n), ceiling(seq_len(n) / 25))
-      for (chunk in chunks) {
-        res <- lapply(chunk, function(i) {
-          a <- as.character(pairs$athlete[i])
-          d <- as.character(pairs$date[i])
-          # get_session_row should already return tibble() on failure
-          get_session_row(a, d)
-        })
-        rows[chunk] <- res
-        fetched <- fetched + length(chunk)
-        incProgress(0.2 + 0.75 * (fetched / n), detail = sprintf("Sessions %d/%d", fetched, n))
+      # --------- SEQUENTIAL FETCH (reliable under Shiny) ---------
+      rows <- vector("list", n)
+      for (i in seq_len(n)) {
+        a <- as.character(pairs$athlete[i])
+        d <- as.character(pairs$date[i])
+        # be defensive with whitespace
+        a <- trimws(a); d <- trimws(d)
+        rows[[i]] <- get_session_row(a, d)  # returns tibble() on failure
+        if (i %% 10 == 0 || i == n) {
+          incProgress(0.1 + 0.8 * (i / max(1, n)), detail = sprintf("Sessions %d/%d", i, n))
+        }
       }
       
       out <- safe_bind_rows(rows)
-      
-      # If enrichment produced data, flatten+normalize and cache; otherwise we keep the index-only cache.
-      if (is.data.frame(out) && nrow(out) > 0) {
+      if (nrow(out) > 0) {
         out <- tibble::as_tibble(
           jsonlite::fromJSON(jsonlite::toJSON(out, auto_unbox = TRUE, null = "null"), flatten = TRUE),
           .name_repair = "universal"
         )
         out <- normalize_cols(out)
-        .DB(out)
-        .DB_meta(list(last_loaded = Sys.time()))
       } else {
-        # keep the index-only cache; still usable for Recent/Report UI
-        showNotification("Could not enrich sessions; showing index list only.", type = "warning", duration = 6)
+        # ---------- FALLBACK: at least keep the index so UI has athlete/date ----------
+        out <- normalize_cols(idx)
       }
       
+      .DB(out)
+      .DB_meta(list(last_loaded = Sys.time()))
+      # showNotification(sprintf("Hydrated %d rows, %d columns.", nrow(out), ncol(out)), type = "message", duration = 5)
       incProgress(1, detail = "Done")
     })
   }
@@ -1111,6 +1080,13 @@ server <- function(input, output, session) {
         stop("missing-template")
       }
       
+      # Columns many templates rely on (for quick sanity)
+      required_any <- c(
+        "athlete","date","athletename","timestamp",
+        "weight_kg_value","height_cm_value",
+        "usg","caliper","fasted","birth_control","creatine"
+      )
+      
       tmpdir <- tempfile("anthro_pdf_"); dir.create(tmpdir, showWarnings = FALSE, recursive = TRUE)
       pdf_files <- character(0)
       
@@ -1122,35 +1098,43 @@ server <- function(input, output, session) {
           
           incProgress((k - 1) / max(1, total), detail = sprintf("Preparing %s…", a))
           
+          # Build full history; normalize and alias for template compatibility
           hist <- fetch_history_hybrid(a)
           if (!is.data.frame(hist) || nrow(hist) == 0) {
             showNotification(paste0("No data found for ", a, "; skipping."), type = "warning", duration = 4)
             next
           }
-          
-          # Normalize + alias for Rmd compatibility
           names(hist) <- tolower(names(hist))
           hist <- make_title_aliases(hist)
-          if (!("athletename" %in% names(hist))) hist$athletename <- hist$athlete %||% NA_character_
           
+          # Prepare render env exactly as template expects
+          if (!("athletename" %in% names(hist))) hist$athletename <- hist$athlete %||% NA_character_
           renv <- new.env(parent = globalenv())
           renv$AthleteData <- hist %>%
             dplyr::rename(AthleteName = athletename) %>%
             dplyr::mutate(Date = suppressWarnings(as.Date(date)))
           
-          # Show chunk errors instead of silent aborts
+          # Make knitr report errors rather than abort silently
           renv$.__set_knitr_opts <- function() knitr::opts_chunk$set(error = TRUE)
           renv$.__set_knitr_opts()
           
-          fmt <- choose_output_format()
-          out_ext <- if (fmt == "pdf_document") ".pdf" else ".html"
-          outname <- paste0(safe_file(a), "_", format(Sys.Date(), "%Y-%m-%d"), out_ext)
+          # Minimal sanity check so we can surface helpful messages
+          if (!any(required_any %in% names(hist))) {
+            showNotification(
+              paste0("Columns not found for ", a, ". First cols: ",
+                     paste(utils::head(names(hist), 10), collapse = ", ")),
+              type = "error", duration = 8
+            )
+            next
+          }
+          
+          outname <- paste0(safe_file(a), "_", format(Sys.Date(), "%Y-%m-%d"), ".pdf")
           outpath <- file.path(tmpdir, outname)
           
           ok <- tryCatch({
             rmarkdown::render(
               input         = "anthro_report_PDF.Rmd",
-              output_format = fmt,
+              output_format = "pdf_document",
               output_file   = outname,
               output_dir    = tmpdir,
               envir         = renv,
