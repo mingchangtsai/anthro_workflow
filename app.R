@@ -1,16 +1,25 @@
+# app.R — CSI Pacific Anthropometry (cached-reads edition)
+
 library(shiny)
 library(shinyWidgets)
 library(shinyTime)
 library(shinyjs)
 library(DT)
-library(tidyverse)
+library(dplyr)
+library(tidyr)
+library(purrr)
+library(tibble)
 library(glue)
+library(lubridate)
 library(jsonlite)
 library(httr)
 library(readxl)
-library(rmarkdown)  # for rendering PDF reports
-library(conflicted)
-suppressMessages(conflict_prefer("validate","shiny"))
+library(readr)
+library(stringr)
+library(rmarkdown)   # for rendering PDF reports
+library(cachem)      # cache for session fetches during hydrate
+library(future)
+library(future.apply)
 
 # ================== API CONFIG ==================
 API_URL <- "https://script.google.com/macros/s/AKfycbxPfNlemEphi3kKsT_A9tDw3PLapodl73vfCGLp05bnvLwmGsPCJkARZhvGQSdt4MkB/exec"
@@ -26,7 +35,50 @@ cap_first <- function(s) {
 }
 norm_name <- function(x) tolower(trimws(x))
 
-# ---------- API HELPERS (no fancy quotes, explicit namespaces) ----------
+# ---- schema normalizer (make sure we always have athlete + date) ----
+normalize_cols <- function(df) {
+  df <- safe_tibble(df)
+  if (!is.data.frame(df) || nrow(df) == 0) return(df)
+  names(df) <- tolower(names(df))
+  # athlete
+  if (!"athlete" %in% names(df)) {
+    if ("athletename" %in% names(df)) df <- dplyr::rename(df, athlete = athletename)
+    else if ("name" %in% names(df))   df <- dplyr::rename(df, athlete = name)
+  }
+  # date
+  if (!"date" %in% names(df)) {
+    if ("collection_date" %in% names(df)) df <- dplyr::rename(df, date = collection_date)
+    else if ("session_date" %in% names(df)) df <- dplyr::rename(df, date = session_date)
+    else if ("timestamp" %in% names(df)) df$date <- as.Date(df$timestamp)
+  }
+  df
+}
+
+safe_file <- function(x) {
+  x <- gsub("[/:*?\"<>|\\s]+", "_", x)
+  x <- gsub("_+", "_", x)
+  trimws(x, which = "both", whitespace = "_")
+}
+
+# ---- safe helpers ----
+safe_tibble <- function(x) {
+  if (is.null(x)) return(tibble())
+  if (inherits(x, "data.frame")) return(tibble::as_tibble(x))
+  if (is.list(x)) {
+    out <- try(tibble::as_tibble(x), silent = TRUE)
+    if (!inherits(out, "try-error")) return(out)
+  }
+  tibble()
+}
+
+safe_bind_rows <- function(lst) {
+  lst <- purrr::compact(lst)      # drop NULLs
+  lst <- lapply(lst, safe_tibble) # coerce each to a tibble (or empty tibble)
+  if (length(lst) == 0) return(tibble())
+  dplyr::bind_rows(lst)
+}
+
+# ---------- API HELPERS ----------
 api_get <- function(params = list()) {
   stopifnot(is.list(params))
   params$key <- API_KEY
@@ -74,53 +126,12 @@ fetch_recent <- function(limit = 10) {
   if (inherits(res, "try-error") || !isTRUE(res$ok) || length(res$data) == 0) {
     return(tibble::tibble(date = character(), athlete = character()))
   }
-  tibble::as_tibble(jsonlite::fromJSON(jsonlite::toJSON(res$data)))
-}
-
-fetch_recent_with_ts <- function(limit = 10, progress = FALSE) {
-  df <- fetch_recent(limit)
-  if (nrow(df) == 0) return(tibble(date = character(), athlete = character(), timestamp = character()))
-  fetch_one <- function(a, d) {
-    got <- try(api_get(list(action = "get_anthro", athlete = a, date = d, cb = as.integer(Sys.time()))), silent = TRUE)
-    ts1 <- ""
-    if (!inherits(got, "try-error") && isTRUE(got$ok) && length(got$data) > 0) {
-      d1 <- try(tibble::as_tibble(jsonlite::fromJSON(jsonlite::toJSON(got$data))), silent = TRUE)
-      if (!inherits(d1, "try-error") && nrow(d1) > 0 && "timestamp" %in% names(d1)) {
-        ts1 <- as.character(d1$timestamp[1])
-      }
-    }
-    tibble(date = d, athlete = a, timestamp = ts1)
+  out <- tibble::as_tibble(jsonlite::fromJSON(jsonlite::toJSON(res$data)))
+  out <- normalize_cols(out)
+  if (!all(c("date","athlete") %in% names(out))) {
+    return(tibble::tibble(date = character(), athlete = character()))
   }
-  rows <- vector("list", nrow(df))
-  if (isTRUE(progress)) {
-    withProgress(message = 'Loading recent entries…', value = 0, {
-      n <- nrow(df)
-      for (i in seq_len(n)) {
-        incProgress(1/n, detail = sprintf("%s — %s", as.character(df$date[i]), as.character(df$athlete[i])))
-        rows[[i]] <- fetch_one(as.character(df$athlete[i]), as.character(df$date[i]))
-      }
-    })
-  } else {
-    for (i in seq_len(nrow(df))) {
-      rows[[i]] <- fetch_one(as.character(df$athlete[i]), as.character(df$date[i]))
-    }
-  }
-  bind_rows(rows) %>%
-    mutate(ts_chr = as.character(timestamp)) %>%
-    arrange(desc(ts_chr)) %>%
-    select(date, athlete, timestamp)
-}
-
-append_rows <- function(rows) {
-  res <- try(api_post(list(action = "append", rows = rows)), silent = TRUE)
-  isTRUE(!inherits(res, "try-error") && isTRUE(res$ok))
-}
-
-replace_rows_for_key <- function(athlete, date, rows) {
-  res <- try(api_post(list(action = "replace",
-                           key = list(athlete = athlete, date = date),
-                           rows = rows)), silent = TRUE)
-  isTRUE(!inherits(res, "try-error") && isTRUE(res$ok))
+  dplyr::select(out, date, athlete) |> dplyr::distinct()
 }
 
 # ================== CHOICES / MEASURES ==================
@@ -227,7 +238,7 @@ calc_value <- function(v1, v2, v3, suggest_txt) {
   }
 }
 
-# ================== BRAND HEADER (black bg, white text, bigger tabs, one logo) ==================
+# ================== BRAND HEADER ==================
 brand_header <- function() {
   tags$div(
     style = "background:#000; color:#fff; padding:14px 18px;",
@@ -269,7 +280,13 @@ ui <- tagList(
       .seg-in { flex: 0 0 12.5%; }
       .seg-sugg { flex: 0 0 25%; }
       .seg-val { flex: 0 0 12.5%; }
-      #recent_tbl table {font-size: 0.85em;} #recent_tbl table th, #recent_tbl table td {font-size: 0.85em;}
+
+      /* Report table width + height */
+      #report-wrapper { width: 70%; }
+      #report-wrapper .datatables, #report_tbl { max-height: 50vh; overflow-y: auto; }
+
+      #recent_tbl table {font-size: 0.85em;} 
+      #recent_tbl table th, #recent_tbl table td {font-size: 0.85em;}
       #report_tbl table { font-size: 0.85em; table-layout: fixed; width: 100%; }
       #report_tbl table th, #report_tbl table td { font-size: 0.85em; padding: 6px 8px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
       #report_tbl input[type=checkbox] { transform: scale(1.1); }
@@ -282,29 +299,6 @@ ui <- tagList(
     tabPanel(
       title = "Data Entry",
       fluidPage(
-        # ======== DO NOT CHANGE THIS TAB (kept as provided) ========
-        tags$head(
-          tags$style(HTML("
-          body { overflow-y: auto; }
-          .card { border: 1px solid #e5e7eb; border-radius: 12px; padding: 16px; margin-bottom: 18px; box-shadow: 0 1px 3px rgba(0,0,0,0.04); overflow: visible; }
-          .row-head { font-weight: 600; color: #374151; padding: 4px 0 8px 0; }
-          .row-line { border-bottom: 1px dashed #e5e7eb; margin-bottom: 6px; padding-bottom: 6px; }
-          .value-box { font-weight: 600; }
-          .muted { color: #6b7280; }
-          .warn { color: #b91c1c; font-size: 0.92em; }
-          input[type=number]::-webkit-outer-spin-button,
-          input[type=number]::-webkit-inner-spin-button { -webkit-appearance: none; margin: 0; }
-          input[type=number] { -moz-appearance: textfield; }
-          .mini-num input.form-control { max-width: 100%; overflow: hidden; }
-          .measure-row { display: flex; align-items: flex-start; gap: 8px; }
-          .seg-name { flex: 0 0 25%; }
-          .seg-in { flex: 0 0 12.5%; }
-          .seg-sugg { flex: 0 0 25%; }
-          .seg-val { flex: 0 0 12.5%; }
-          #recent_tbl table {font-size: 0.85em;} #recent_tbl table th, #recent_tbl table td {font-size: 0.85em;}
-        "))
-        ),
-        
         sidebarLayout(
           sidebarPanel(
             width = 3,
@@ -321,7 +315,7 @@ ui <- tagList(
             pickerInput("scale", "Scale", choices = scale_choices, multiple = FALSE,
                         options = pickerOptions(style = "btn-outline-primary")),
             hr(),
-            actionButton("prefill_btn", "Prefill from Athlete's Recent Data",
+            actionButton("prefill_btn", "Prefill Athlete's Recent Data",
                          class = "btn-outline-secondary", width = "100%"),
             br(), br(),
             actionButton("submit", "Submit & Save", class = "btn-primary", width = "100%"),
@@ -329,12 +323,15 @@ ui <- tagList(
             h4("Batch upload"),
             fileInput("batch_file", "Excel (.xlsx) file only", accept = c(".xlsx"),
                       buttonLabel = "Browse..."),
-            actionButton("upload_btn", "Upload to Database", class = "btn-warning", width = "100%"),
+            actionButton("upload_btn", "Upload to Google Sheet", class = "btn-warning", width = "100%"),
             br(),
             textOutput("upload_status"),
             br(),
             verbatimTextOutput("status"),
             h4("Last 10 entries"),
+            # verbatimTextOutput("db_debug"),
+            # verbatimTextOutput("idx_debug"),
+            # verbatimTextOutput("db_head"),
             DTOutput("recent_tbl"),
             br()
           ),
@@ -369,10 +366,10 @@ ui <- tagList(
       fluidPage(
         tags$head(
           tags$style(HTML("
-          #report_tbl table { font-size: 1em; table-layout: fixed; width: 100%; }
-          #report_tbl table th, #report_tbl table td { font-size: 1em; padding: 6px 8px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-          #report_tbl input[type=checkbox] { transform: scale(1.1); }
-        "))
+            #report_tbl table { font-size: 0.85em; table-layout: fixed; width: 100%; }
+            #report_tbl table th, #report_tbl table td { font-size: 0.85em; padding: 6px 8px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+            #report_tbl input[type=checkbox] { transform: scale(1.1); }
+          "))
         ),
         fluidRow(
           column(4, actionButton("report_reload", "Reload list", class = "btn-outline-secondary", width = "100%")),
@@ -380,7 +377,7 @@ ui <- tagList(
           column(4, actionButton("report_select_none", "Select none", class = "btn-outline-secondary", width = "100%"))
         ),
         br(),
-        div(style="width:70%; height:50vh; overflow:auto;", DTOutput("report_tbl")),  # 70% width table
+        div(id="report-wrapper", DTOutput("report_tbl")),
         tags$script(HTML("
           $(document).on('change', 'input[type=checkbox][id^=sel_]', function(){
             var ids = $('input[type=checkbox][id^=sel_]:checked').map(function(){return this.id;}).get();
@@ -409,34 +406,205 @@ ui <- tagList(
 
 # ================== SERVER ==================
 server <- function(input, output, session) {
-  # Startup progress
+  # ---------- Full DB cache (read-once model) ----------
+  .DB <- reactiveVal(tibble::tibble())      # all session rows
+  .DB_meta <- reactiveVal(list(last_loaded = NA))
+  .session_cache <- cache_mem(max_age = 3600) # per-session fetch cache during hydrate
+  .IDX <- reactiveVal(tibble::tibble())  # holds the recent_anthro index used for hydration
+  
+  # Treat a row as "full" (not just athlete/date)
+  has_measure_cols <- function(df) {
+    if (!is.data.frame(df) || ncol(df) <= 2) return(FALSE)
+    nm <- names(df)
+    any(grepl("(_m1|_m2|_m3|_value|_suggest)$", nm)) ||
+      any(nm %in% c("height_cm_m1","weight_kg_m1","usg","caliper","fasted","birth_control","creatine"))
+  }
+  
+  # Pull a single FULL session row; use API if cache row is skinny
+  fetch_full_session_row <- function(a, d) {
+    a <- trimws(a); d <- trimws(d)
+    db <- .DB()
+    if (is.data.frame(db) && nrow(db) > 0) {
+      hit <- db %>%
+        dplyr::filter(tolower(trimws(athlete)) == tolower(a),
+                      as.character(date) == as.character(d)) %>%
+        dplyr::slice(1)
+      if (is.data.frame(hit) && nrow(hit) == 1 && has_measure_cols(hit)) {
+        return(hit)
+      }
+    }
+    got <- try(api_get(list(action = "get_anthro", athlete = a, date = d,
+                            cb = as.integer(Sys.time()))), silent = TRUE)
+    if (!inherits(got, "try-error") && isTRUE(got$ok) && length(got$data) > 0) {
+      dat <- try(tibble::as_tibble(jsonlite::fromJSON(jsonlite::toJSON(got$data), flatten = TRUE)),
+                 silent = TRUE)
+      if (!inherits(dat, "try-error") && nrow(dat) > 0) {
+        dat <- normalize_cols(dat)
+        return(dat[1, ])
+      }
+    }
+    tibble::tibble()
+  }
+  
+  # Dates for athlete from the index you hydrated
+  athlete_dates_from_index <- function(ath) {
+    idx <- try(.IDX(), silent = TRUE)
+    if (inherits(idx, "try-error") || !is.data.frame(idx) || nrow(idx) == 0) return(character(0))
+    idx %>%
+      dplyr::filter(tolower(trimws(athlete)) == tolower(trimws(ath))) %>%
+      dplyr::distinct(date) %>%
+      dplyr::arrange(dplyr::desc(as.character(date))) %>%
+      dplyr::pull(date) %>%
+      as.character()
+  }
+  
+  # Build full history for an athlete (index -> per-date full rows)
+  fetch_history_hybrid <- function(ath) {
+    dates <- athlete_dates_from_index(ath)
+    if (length(dates) == 0) {
+      db <- .DB()
+      if (is.data.frame(db) && nrow(db) > 0) {
+        return(db %>%
+                 dplyr::filter(tolower(trimws(athlete)) == tolower(trimws(ath))) %>%
+                 tibble::as_tibble())
+      }
+      return(tibble::tibble())
+    }
+    rows <- lapply(dates, function(d) fetch_full_session_row(ath, d))
+    out <- safe_bind_rows(rows)
+    if (nrow(out) > 0) {
+      out <- tibble::as_tibble(
+        jsonlite::fromJSON(jsonlite::toJSON(out, auto_unbox = TRUE, null = "null"), flatten = TRUE),
+        .name_repair = "universal"
+      )
+      out <- normalize_cols(out)
+    }
+    out
+  }
+  
+  # Create TitleCase aliases so older Rmds can use either name form
+  make_title_aliases <- function(d) {
+    nm <- names(d)
+    for (nm0 in nm) {
+      alias <- paste0(toupper(substr(nm0, 1, 1)), substring(nm0, 2))
+      if (!identical(alias, nm0) && !(alias %in% nm)) d[[alias]] <- d[[nm0]]
+    }
+    d
+  }
+  
+  # helper to make a cache-safe key
+  cache_key <- function(ath, d) {
+    a <- tolower(gsub("[^a-z0-9]+", "", ath))
+    dd <- tolower(gsub("[^a-z0-9]+", "", d))
+    paste0(a, "_", dd)
+  }
+  
+  hydrate_full_db <- function(limit = 5000) {
+    withProgress(message = "Downloading database…", value = 0, {
+      incProgress(0.1, detail = "Fetching index")
+      idx <- fetch_recent(limit)
+      .IDX(idx)  # <- store for debug + UI fallbacks
+      
+      if (nrow(idx) == 0 || !all(c("athlete","date") %in% names(idx))) {
+        .DB(tibble()); .DB_meta(list(last_loaded = Sys.time()))
+        showNotification("Index from API did not include 'athlete' and 'date'.", type = "error", duration = 6)
+        return(invisible(NULL))
+      }
+      
+      # distinct pairs, newest first
+      pairs <- idx %>% dplyr::distinct(athlete, date) %>% dplyr::arrange(dplyr::desc(date))
+      n <- nrow(pairs)
+      
+      # --------- SEQUENTIAL FETCH (reliable under Shiny) ---------
+      rows <- vector("list", n)
+      for (i in seq_len(n)) {
+        a <- as.character(pairs$athlete[i])
+        d <- as.character(pairs$date[i])
+        # be defensive with whitespace
+        a <- trimws(a); d <- trimws(d)
+        rows[[i]] <- get_session_row(a, d)  # returns tibble() on failure
+        if (i %% 10 == 0 || i == n) {
+          incProgress(0.1 + 0.8 * (i / max(1, n)), detail = sprintf("Sessions %d/%d", i, n))
+        }
+      }
+      
+      out <- safe_bind_rows(rows)
+      if (nrow(out) > 0) {
+        out <- tibble::as_tibble(
+          jsonlite::fromJSON(jsonlite::toJSON(out, auto_unbox = TRUE, null = "null"), flatten = TRUE),
+          .name_repair = "universal"
+        )
+        out <- normalize_cols(out)
+      } else {
+        # ---------- FALLBACK: at least keep the index so UI has athlete/date ----------
+        out <- normalize_cols(idx)
+      }
+      
+      .DB(out)
+      .DB_meta(list(last_loaded = Sys.time()))
+      # showNotification(sprintf("Hydrated %d rows, %d columns.", nrow(out), ncol(out)), type = "message", duration = 5)
+      incProgress(1, detail = "Done")
+    })
+  }
+  
+  # ---------- Startup ----------
   session$onFlushed(function() {
     withProgress(message = 'Loading dashboard…', value = 0, {
-      incProgress(0.3, detail = 'Fetching recent entries')
-      recent_data(fetch_recent_with_ts(10, progress = TRUE))
+      incProgress(0.2, detail = 'Loading database')
+      hydrate_full_db(limit = 5000)
+      
       incProgress(0.7, detail = 'Loading dropdowns')
       updateSelectizeInput(session, "practitioner", choices = load_practitioners(), server = TRUE)
       updateSelectizeInput(session, "athlete", choices = load_athletes(), server = TRUE)
       incProgress(1, detail = 'Ready')
     })
   }, once = TRUE)
-
+  
   # USG inline warning
   output$usg_warn <- renderUI({
     v <- input$usg
     if (is.null(v) || is.na(v)) return(span(class="muted",""))
     if (v < 0.950 || v > 1.080) span(class="warn","Warning: USG out of range (expected 0.950–1.080).") else span(class="muted","")
   })
-
-  # Recent list on sidebar
-  recent_data <- reactiveVal(tibble(date = character(), athlete = character(), timestamp = character()))
+  
+  # ---------- Recent list (from cache) ----------
+  recent_from_cache <- reactive({
+    db <- .DB()
+    # If full DB is good, use it
+    if (is.data.frame(db) && nrow(db) > 0 && all(c("date","athlete") %in% names(db))) {
+      has_ts <- "timestamp" %in% names(db)
+      return(
+        db %>%
+          transmute(
+            date = as.character(date),
+            athlete = as.character(athlete),
+            ts = if (has_ts) as.character(timestamp) else as.character(date)
+          ) %>%
+          distinct() %>%
+          arrange(desc(ts)) %>%
+          slice_head(n = 10) %>%
+          select(date, athlete)
+      )
+    }
+    # Otherwise, fall back to the index
+    idx <- .IDX()
+    if (is.data.frame(idx) && nrow(idx) > 0 && all(c("date","athlete") %in% names(idx))) {
+      return(
+        idx %>%
+          transmute(date = as.character(date), athlete = as.character(athlete)) %>%
+          distinct() %>%
+          slice_head(n = 10)
+      )
+    }
+    tibble::tibble(date = character(), athlete = character())
+  })
+  
   output$recent_tbl <- renderDT({
-    df <- recent_data()
-    if (is.null(df) || nrow(df) == 0) {
+    df2 <- recent_from_cache() %>% select(date, athlete) %>% rename(Date = date, Athlete = athlete)
+    if (nrow(df2) == 0) {
       datatable(data.frame(Date = character(), Athlete = character()),
                 options = list(dom = 't', paging = FALSE), rownames = FALSE)
     } else {
-      df2 <- df %>% select(date, athlete) %>% rename(Date = date, Athlete = athlete)
       datatable(df2,
                 options = list(dom = 't', paging = FALSE,
                                columnDefs = list(list(width = "60%", targets = 0),
@@ -444,8 +612,35 @@ server <- function(input, output, session) {
                 rownames = FALSE)
     }
   })
-
-  # ---------- Measures UI (unchanged) ----------
+  
+  # ---------- Debug footer ----------
+  # output$db_debug <- renderText({
+  #   db <- .DB()
+  #   if (!is.data.frame(db) || nrow(db) == 0) {
+  #     return("DB rows: 0\nCols: <none or not loaded>")
+  #   }
+  #   paste0(
+  #     "DB rows: ", nrow(db), "\n",
+  #     "Cols: ", paste(names(db), collapse = ", ")
+  #   )
+  # })
+  # 
+  # output$idx_debug <- renderText({
+  #   idx <- .IDX()
+  #   if (!is.data.frame(idx) || nrow(idx) == 0) return("IDX rows: 0\nCols: <none>")
+  #   paste0("IDX rows: ", nrow(idx), "\nCols: ", paste(names(idx), collapse = ", "))
+  # })
+  # 
+  # output$db_head <- renderText({
+  #   db <- .DB()
+  #   if (!is.data.frame(db) || nrow(db) == 0) return("<empty>")
+  #   # show the first few athlete/date/timestamp rows
+  #   cols <- intersect(c("date","athlete","timestamp"), names(db))
+  #   utils::capture.output(print(utils::head(db[cols], 5)))
+  # })
+  
+  
+  # ---------- Measures UI ----------
   register_guard <- function(id, lo, hi, label = "Value") {
     observeEvent(input[[id]], {
       v <- input[[id]]
@@ -455,7 +650,7 @@ server <- function(input, output, session) {
       }
     }, ignoreInit = TRUE)
   }
-
+  
   build_row <- function(category, item, idx) {
     base <- paste0(safe_id(category), "_", safe_id(item), "_", idx)
     id1 <- paste0("m1_", base)
@@ -463,28 +658,28 @@ server <- function(input, output, session) {
     id3 <- paste0("m3_", base)
     idsugg <- paste0("sugg_", base)
     idval <- paste0("val_", base)
-
+    
     bnds <- bounds_for(category, item)
     lo <- bnds[1]; hi <- bnds[2]
-
+    
     output[[idsugg]] <- renderUI({
       v1 <- input[[id1]]; v2 <- input[[id2]]
       th <- threshold_for(category)
       msg <- suggest_msg(v1, v2, th)
       if (is.na(msg)) span(class="muted","—") else span(msg)
     })
-
+    
     output[[idval]] <- renderUI({
       v1 <- input[[id1]]; v2 <- input[[id2]]; v3 <- input[[id3]]
       th <- threshold_for(category); msg <- suggest_msg(v1, v2, th)
       vv <- calc_value(v1, v2, v3, msg)
       if (is.na(vv)) span(class="muted","—") else span(class="value-box", sprintf("%.2f", vv))
     })
-
+    
     register_guard(id1, lo, hi, "Measure 1")
     register_guard(id2, lo, hi, "Measure 2")
     register_guard(id3, lo, hi, "Measure 3")
-
+    
     div(class="row-line measure-row",
         div(class="seg-name", div(style="padding-top:6px;", cap_first(item))),
         div(class="seg-in",   div(class="mini-num", numericInput(id1, "1", value = NA, min = lo, max = hi, step = 0.1, width = "100%"))),
@@ -494,7 +689,7 @@ server <- function(input, output, session) {
         div(class="seg-val",  div(tags$label("Value"), uiOutput(idval)))
     )
   }
-
+  
   output$measures_ui <- renderUI({
     tagList(
       lapply(names(measures_list), function(cat) {
@@ -506,8 +701,8 @@ server <- function(input, output, session) {
       })
     )
   })
-
-  # ---------- Prefill (latest for athlete) ----------
+  
+  # ---------- Prefill (from cache) ----------
   clear_form <- function() {
     updateSelectizeInput(session, "practitioner", selected = "")
     try(shinyTime::updateTimeInput(session, "time",
@@ -534,24 +729,27 @@ server <- function(input, output, session) {
       }
     }
   }
-
+  
   observeEvent(input$prefill_btn, {
     withProgress(message = 'Prefilling…', value = 0, {
       req(input$athlete)
-      incProgress(0.15, detail = 'Contacting API')
-      rec <- try(api_get(list(action = "recent_anthro", limit = 1000, cb = as.integer(Sys.time()))), silent = TRUE)
-      validate(need(!inherits(rec, "try-error") && isTRUE(rec$ok) && length(rec$data) > 0, "No recent entries."))
-      rdf <- as_tibble(jsonlite::fromJSON(jsonlite::toJSON(rec$data)))
+      db <- .DB()
+      
+      validate(
+        need(is.data.frame(db) && nrow(db) > 0, "No entries in local cache yet. Click Reload list, or add data first."),
+        need("athlete" %in% names(db), "Cache doesn’t include an 'athlete' column. Try Reload list.")
+      )
+      
       target <- norm_name(input$athlete)
-      rdf2 <- rdf %>% mutate(`_ath` = tolower(trimws(athlete))) %>% filter(`_ath` == target)
-      validate(need(nrow(rdf2) > 0, "No recent entries for this athlete."))
-      latest_date <- as.character(rdf2$date[1])
-      incProgress(0.5, detail = 'Fetching session row')
-      got <- try(api_get(list(action = "get_anthro", athlete = input$athlete, date = latest_date, cb = as.integer(Sys.time()))), silent = TRUE)
-      validate(need(!inherits(got, "try-error") && isTRUE(got$ok) && length(got$data) > 0, "No session row."))
-      dat <- as_tibble(jsonlite::fromJSON(jsonlite::toJSON(got$data)))
-      row <- dat[1,]
-
+      rdf2 <- db %>% mutate(`_ath` = tolower(trimws(athlete))) %>% filter(`_ath` == target)
+      validate(need(nrow(rdf2) > 0, "No entries in local cache for this athlete. Try Reload list."))
+      
+      row <- if ("timestamp" %in% names(rdf2)) {
+        rdf2 %>% arrange(desc(timestamp)) %>% slice(1)
+      } else {
+        rdf2 %>% arrange(desc(as.Date(date))) %>% slice(1)
+      }
+      
       if ("practitioner" %in% names(row)) updateSelectizeInput(session, "practitioner", selected = row$practitioner)
       updateSelectizeInput(session, "athlete", selected = input$athlete)
       if ("date" %in% names(row)) {
@@ -572,7 +770,7 @@ server <- function(input, output, session) {
       if ("usg" %in% names(row))      updateNumericInput(session, "usg", value = suppressWarnings(as.numeric(row$usg)))
       if ("caliper" %in% names(row))  updatePickerInput(session, "caliper", selected = row$caliper)
       if ("comments" %in% names(row)) updateTextAreaInput(session, "comments", value = row$comments %||% "")
-
+      
       for (cat in names(measures_list)) {
         items <- measures_list[[cat]]
         for (i in seq_along(items)) {
@@ -598,11 +796,10 @@ server <- function(input, output, session) {
           if (!is.null(input[[id3]])) updateNumericInput(session, id3, value = v3)
         }
       }
-      incProgress(0.95, detail = 'Done')
     })
     showNotification(glue("Prefilled data for {input$athlete}."), type="message", duration=5)
   })
-
+  
   # ---------- Assemble wide row ----------
   assemble_wide <- function() {
     req(input$athlete, input$date)
@@ -644,11 +841,11 @@ server <- function(input, output, session) {
     }
     row
   }
-
+  
   # ---------- Save with duplicate detection ----------
   output$status <- renderText("")
   pending_row <- reactiveVal(NULL)
-
+  
   observeEvent(input$submit, {
     errs <- c()
     if (is.null(input$athlete) || !nzchar(trimws(input$athlete))) errs <- c(errs, "Athlete is required.")
@@ -661,8 +858,10 @@ server <- function(input, output, session) {
       output$status <- renderText(paste(errs, collapse = "\n"))
       return(NULL)
     }
-    rec <- fetch_recent(1000)
-    dup_exists <- nrow(rec %>%
+    
+    # Check duplicate in local cache
+    db_now <- .DB()
+    dup_exists <- nrow(db_now %>%
                          filter(tolower(trimws(athlete)) == tolower(trimws(out$athlete)),
                                 as.character(date) == as.character(out$date))) > 0
     if (dup_exists) {
@@ -686,31 +885,40 @@ server <- function(input, output, session) {
       ))
       return(invisible(NULL))
     }
-    ok <- append_rows(list(out))
+    
+    ok <- isTRUE(append_rows(list(out)))
     if (ok) {
+      new_row <- tibble::as_tibble(jsonlite::fromJSON(jsonlite::toJSON(out), flatten = TRUE))
+      new_row <- normalize_cols(new_row)
+      db_now <- .DB()
+      .DB(bind_rows(new_row, db_now))
       output$status <- renderText("Saved to database")
-      recent_data(fetch_recent_with_ts(10, progress = TRUE))
-      clear_form()
     } else {
       output$status <- renderText("Error: could not save to database")
     }
   })
-
+  
   observeEvent(input$confirm_replace, {
     req(!is.null(pending_row()))
     out <- pending_row()
     removeModal()
-    ok <- replace_rows_for_key(out$athlete, out$date, list(out))
+    ok <- isTRUE(replace_rows_for_key(out$athlete, out$date, list(out)))
     if (ok) {
+      db_now <- .DB()
+      # drop old (athlete, date) then prepend normalized new row
+      db_now2 <- db_now %>%
+        dplyr::filter(!(tolower(trimws(athlete)) == tolower(trimws(out$athlete)) &
+                          as.character(date) == as.character(out$date)))
+      new_row <- tibble::as_tibble(jsonlite::fromJSON(jsonlite::toJSON(out), flatten = TRUE))
+      new_row <- normalize_cols(new_row)
+      .DB(bind_rows(new_row, db_now2))
       output$status <- renderText("Existing record overwritten and saved to database")
       pending_row(NULL)
-      recent_data(fetch_recent_with_ts(10, progress = TRUE))
-      clear_form()
     } else {
       output$status <- renderText("Error: could not overwrite existing record")
     }
   })
-
+  
   # ---------- Batch upload (.xlsx) ----------
   output$upload_status <- renderText("")
   observeEvent(input$upload_btn, {
@@ -729,37 +937,38 @@ server <- function(input, output, session) {
       incProgress(0.8, detail = "Saving to Google Sheet")
       ok <- append_rows(rows)
       if (ok) {
+        # Simple approach: re-hydrate to reflect batch upload
+        hydrate_full_db(limit = 5000)
         output$upload_status <- renderText("Batch upload complete.")
-        recent_data(fetch_recent_with_ts(10, progress = FALSE))
       } else {
         output$upload_status <- renderText("Batch upload failed.")
       }
       incProgress(1, detail = "Done")
     })
   })
-
+  
   # ================== REPORT TAB ==================
-  report_df <- reactiveVal({
-    tryCatch(
-      fetch_recent_with_ts(200, progress = FALSE) %>% 
-        dplyr::mutate(.dt=suppressWarnings(lubridate::ymd(date))) %>% 
-        dplyr::arrange(dplyr::desc(.dt), athlete) %>% 
-        dplyr::select(-.dt),
-      error = function(e) {
-      tibble(date = character(), athlete = character(), timestamp = character())
-    })
+  # Use cache for report listing (most recent first)
+  report_df <- reactive({
+    db <- .DB()
+    if (!is.data.frame(db) || nrow(db) == 0 || !all(c("date","athlete") %in% names(db))) {
+      return(tibble(date = character(), athlete = character(), timestamp = character()))
+    }
+    has_ts <- "timestamp" %in% names(db)
+    db %>%
+      transmute(
+        date = as.character(date),
+        athlete = as.character(athlete),
+        timestamp = if (has_ts) as.character(timestamp) else as.character(date)
+      ) %>%
+      distinct() %>%
+      arrange(desc(timestamp))
   })
-
+  
+  # Reload button: re-hydrate once
   observeEvent(input$report_reload, {
-    report_df(
-      tryCatch(
-        fetch_recent_with_ts(200, progress = TRUE) %>%
-          dplyr::mutate(.dt = suppressWarnings(lubridate::ymd(date))) %>%
-          dplyr::arrange(dplyr::desc(.dt), athlete) %>% 
-          dplyr::select(-.dt),
-        error = function(e) tibble(date = character(), athlete = character(), timestamp = character())
-      )
-    )
+    hydrate_full_db(limit = 5000)
+    showNotification("Database reloaded.", type = "message")
   })
   
   # Enable/disable Download buttons based on selection
@@ -773,133 +982,83 @@ server <- function(input, output, session) {
       shinyjs::enable('report_print_zip')
     }
   })
-
-  # output$report_tbl <- renderDT({
-  #   df <- report_df()
-  #   if (nrow(df) == 0) {
-  #     return(datatable(data.frame(Select = character(), `Collection Date` = character(), Athlete = character()),
-  #                      escape = FALSE, rownames = FALSE, options = list(dom = 't', paging = FALSE)))
-  #   }
-  #   df2 <- df %>% select(date, athlete) %>% rename(`Collection Date` = date, Athlete = athlete)
-  #   n <- nrow(df2)
-  #   checks <- vapply(seq_len(n), function(i) as.character(checkboxInput(paste0("sel_", i), label = NULL, value = FALSE)), character(1))
-  #   out <- cbind(Select = checks, df2)
-  #   datatable(out, escape = FALSE, rownames = FALSE, selection = "none",
-  #             options = list(pageLength = 25, dom = 'tip', ordering = FALSE, autoWidth = FALSE))
-  # }, server = FALSE)
   
   output$report_tbl <- renderDT({
     df <- report_df()
     if (nrow(df) == 0) {
-      return(datatable(
-        data.frame(Select = character(), `Collection Date` = character(), Athlete = character()),
-        escape = FALSE, rownames = FALSE,
-        options = list(dom = 't', paging = FALSE, scrollY = '50vh', scrollCollapse = TRUE)
-      ))
+      return(datatable(data.frame(Select = character(), `Collection Date` = character(), Athlete = character()),
+                       escape = FALSE, rownames = FALSE, options = list(dom = 't', paging = FALSE)))
     }
     df2 <- df %>% select(date, athlete) %>% rename(`Collection Date` = date, Athlete = athlete)
     n <- nrow(df2)
-    checks <- vapply(seq_len(n),
-                     function(i) as.character(checkboxInput(paste0("sel_", i), label = NULL, value = FALSE)),
-                     character(1))
+    checks <- vapply(seq_len(n), function(i) as.character(checkboxInput(paste0("sel_", i), label = NULL, value = FALSE)), character(1))
     out <- cbind(Select = checks, df2)
-    datatable(
-      out, escape = FALSE, rownames = FALSE, selection = "none",
-      options = list(
-        pageLength = 25,
-        dom = 'tip',
-        ordering = FALSE,
-        autoWidth = FALSE,
-        paging = FALSE,            # no paging
-        scrollY = '50vh',          # 50% viewport height
-        scrollCollapse = TRUE
-      )
-    )
+    datatable(out, escape = FALSE, rownames = FALSE, selection = "none",
+              options = list(pageLength = 25, dom = 'tip', ordering = FALSE, autoWidth = FALSE))
   }, server = FALSE)
   
-
   observeEvent(input$report_select_all, {
     runjs("$('input[type=checkbox][id^=sel_]').prop('checked', true).trigger('change');var ids=$('input[type=checkbox][id^=sel_]:checked').map(function(){return this.id;}).get();Shiny.setInputValue('report_selected', ids, {priority:'event'});")
   })
-
+  
   observeEvent(input$report_select_none, {
     runjs("$('input[type=checkbox][id^=sel_]').prop('checked', false).trigger('change');Shiny.setInputValue('report_selected', [], {priority:'event'});")
   })
-
-  # ---- Report helpers ----
-  fetch_dates_for_athlete <- function(ath) {
-    # Try endpoint
-    res <- try(api_get(list(action = "dates_for_athlete", athlete = ath, cb = as.integer(Sys.time()))), silent = TRUE)
-    if (!inherits(res, "try-error") && isTRUE(res$ok) && length(res$data) > 0) {
-      d <- try(tibble::as_tibble(jsonlite::fromJSON(jsonlite::toJSON(res$data))), silent = TRUE)
-      if (!inherits(d, "try-error")) {
-        cand <- if ("norm" %in% names(d)) d$norm else if ("date" %in% names(d)) d$date else character()
-        cand <- unique(trimws(as.character(cand)))
-        cand <- cand[nzchar(cand)]
-        if (length(cand)) return(sort(cand))
-      }
-    }
-    # Fallback to recent
-    rec <- fetch_recent(2000)
-    out <- rec %>%
-      dplyr::filter(norm_name(athlete) == norm_name(ath)) %>%
-      dplyr::pull(date) %>%
-      as.character() %>%
-      trimws() %>%
-      unique()
-    sort(out)
-  }
   
+  # ---- Local history helper (from cache) ----
   fetch_athlete_history <- function(ath) {
     dates <- fetch_dates_for_athlete(ath)
     if (length(dates) == 0) return(tibble())
     
-    rows <- vector("list", length(dates))
-    for (i in seq_along(dates)) {
-      d0 <- as.character(dates[[i]])
-      got <- try(api_get(list(action = "get_anthro", athlete = ath, date = d0, cb = as.integer(Sys.time()))), silent = TRUE)
-      if (!inherits(got, "try-error") && isTRUE(got$ok) && length(got$data) > 0) {
-        dat <- try(tibble::as_tibble(jsonlite::fromJSON(jsonlite::toJSON(got$data), flatten = TRUE)), silent = TRUE)
-        if (!inherits(dat, "try-error") && nrow(dat) > 0) {
-          rowi <- dat[1, , drop = FALSE]
-          # force the requested date into the row to avoid API-side inconsistencies
-          rowi$date <- d0
-          rows[[i]] <- rowi
-        }
-      }
+    rows <- lapply(dates, function(d) {
+      get_session_row(ath, d)  # already returns tibble() on failure
+    })
+    
+    out <- safe_bind_rows(rows)
+    if (nrow(out) > 0) {
+      out <- tibble::as_tibble(
+        jsonlite::fromJSON(jsonlite::toJSON(out, auto_unbox = TRUE, null = "null"), flatten = TRUE),
+        .name_repair = "universal"
+      )
     }
-    
-    out <- dplyr::bind_rows(rows)
-    if (nrow(out) == 0) return(out)
-    
-    # normalize types
-    names(out) <- tolower(names(out))
-    if (!inherits(out$date, "Date")) {
-      suppressWarnings({
-        out$date <- as.Date(out$date)
-      })
-    }
-    
-    # clean + sort
-    out <- out %>%
-      tibble::as_tibble() %>%
-      dplyr::filter(!is.na(date)) %>%
-      dplyr::arrange(date)
-    
+    out
+  }
+
+  # ---- Local history helper (from cache ONLY; no API calls) ----
+  fetch_athlete_history_local <- function(ath) {
+    db <- .DB()
+    if (!is.data.frame(db) || nrow(db) == 0) return(tibble::tibble())
+    target <- tolower(trimws(ath))
+    out <- db %>%
+      dplyr::filter(tolower(trimws(athlete)) == target) %>%
+      dplyr::arrange(dplyr::desc(as.Date(as.character(date)))) %>%
+      tibble::as_tibble()
     out
   }
   
-  safe_file <- function(x) {
-    x <- gsub("[/:*?\"<>|\\s]+", "_", x)
-    x <- gsub("_+", "_", x)
-    trimws(x, which = "both", whitespace = "_")
-  }
 
-  # ---- Print Report(s) -> ZIP of PDFs (tempdir) ----
+  # cache key already sanitized elsewhere
+  get_session_row <- function(ath, d) {
+    key <- cache_key(ath, d)
+    hit <- .session_cache$get(key)
+    if (!is.null(hit)) return(hit)
+    
+    got <- try(api_get(list(action="get_anthro", athlete=ath, date=d, cb=as.integer(Sys.time()))),
+               silent = TRUE)
+    
+    out <- tibble() # <- IMPORTANT: default to empty tibble, not NULL
+    if (!inherits(got, "try-error") && isTRUE(got$ok) && length(got$data) > 0) {
+      dat <- try(tibble::as_tibble(jsonlite::fromJSON(jsonlite::toJSON(got$data), flatten = TRUE)),
+                 silent = TRUE)
+      if (!inherits(dat, "try-error") && nrow(dat) > 0) out <- dat[1,]
+    }
+    .session_cache$set(key, out)
+    out
+  }
+  
+  # ---- Print Report(s) -> ZIP of PDFs (reads from cache) ----
   output$report_print_zip <- downloadHandler(
-    filename = function() {
-      paste0(format(Sys.Date(), "%Y-%m-%d"), "_anthro_report.zip")
-    },
+    filename = function() paste0(format(Sys.Date(), "%Y-%m-%d"), "_anthro_report.zip"),
     contentType = "application/zip",
     content = function(file) {
       ids <- isolate(input$report_selected)
@@ -907,7 +1066,6 @@ server <- function(input, output, session) {
         showNotification("Please select at least one row to print.", type = "warning", duration = 4)
         stop("no-selection")
       }
-      
       df <- report_df()
       n <- nrow(df)
       sel_idx <- suppressWarnings(as.integer(gsub("^sel_", "", ids)))
@@ -922,10 +1080,14 @@ server <- function(input, output, session) {
         stop("missing-template")
       }
       
-      # session temp dir
-      tmpdir <- file.path(tempdir(), paste0("anthro_pdf_", as.integer(Sys.time())))
-      dir.create(tmpdir, recursive = TRUE, showWarnings = FALSE)
+      # Columns many templates rely on (for quick sanity)
+      required_any <- c(
+        "athlete","date","athletename","timestamp",
+        "weight_kg_value","height_cm_value",
+        "usg","caliper","fasted","birth_control","creatine"
+      )
       
+      tmpdir <- tempfile("anthro_pdf_"); dir.create(tmpdir, showWarnings = FALSE, recursive = TRUE)
       pdf_files <- character(0)
       
       withProgress(message = "Rendering reports…", value = 0, {
@@ -934,34 +1096,39 @@ server <- function(input, output, session) {
           i <- sel_idx[k]
           a <- as.character(df$athlete[i])
           
-          incProgress((k - 1) / max(1, total), detail = sprintf("Building %s…", a))
+          incProgress((k - 1) / max(1, total), detail = sprintf("Preparing %s…", a))
           
-          # pull full athlete history from API (helpers already defined in app.R)
-          hist <- fetch_athlete_history(a)
-          if (nrow(hist) == 0) {
+          # Build full history; normalize and alias for template compatibility
+          hist <- fetch_history_hybrid(a)
+          if (!is.data.frame(hist) || nrow(hist) == 0) {
             showNotification(paste0("No data found for ", a, "; skipping."), type = "warning", duration = 4)
             next
           }
-          
-          # build AthleteData as in the working test script
           names(hist) <- tolower(names(hist))
-          req_base <- c("practitioner","athlete","date","comments")
-          for (nm in req_base) if (!nm %in% names(hist)) hist[[nm]] <- NA_character_
-          if (!inherits(hist$date, "Date")) suppressWarnings(hist$date <- as.Date(hist$date))
+          hist <- make_title_aliases(hist)
           
-          value_cols <- grep("(_cm_value|_mm_value|_kg_value|_value)$", names(hist), value = TRUE)
-          hist[value_cols] <- lapply(hist[value_cols], function(x) suppressWarnings(as.numeric(x)))
-          
-          AthleteData <- hist %>%
-            dplyr::select(dplyr::all_of(req_base), dplyr::all_of(value_cols)) %>%
-            dplyr::arrange(dplyr::desc(date))
-          
-          # inject via environment
+          # Prepare render env exactly as template expects
+          if (!("athletename" %in% names(hist))) hist$athletename <- hist$athlete %||% NA_character_
           renv <- new.env(parent = globalenv())
-          renv$AthleteData <- AthleteData
+          renv$AthleteData <- hist %>%
+            dplyr::rename(AthleteName = athletename) %>%
+            dplyr::mutate(Date = suppressWarnings(as.Date(date)))
           
-          # filename uses the raw athlete name (only '/' replaced to avoid subpaths)
-          outname <- paste0(gsub("/", "-", a), "_", format(Sys.Date(), "%Y-%m-%d"), ".pdf")
+          # Make knitr report errors rather than abort silently
+          renv$.__set_knitr_opts <- function() knitr::opts_chunk$set(error = TRUE)
+          renv$.__set_knitr_opts()
+          
+          # Minimal sanity check so we can surface helpful messages
+          if (!any(required_any %in% names(hist))) {
+            showNotification(
+              paste0("Columns not found for ", a, ". First cols: ",
+                     paste(utils::head(names(hist), 10), collapse = ", ")),
+              type = "error", duration = 8
+            )
+            next
+          }
+          
+          outname <- paste0(safe_file(a), "_", format(Sys.Date(), "%Y-%m-%d"), ".pdf")
           outpath <- file.path(tmpdir, outname)
           
           ok <- tryCatch({
@@ -971,11 +1138,12 @@ server <- function(input, output, session) {
               output_file   = outname,
               output_dir    = tmpdir,
               envir         = renv,
-              quiet         = TRUE
+              quiet         = FALSE,
+              clean         = TRUE
             )
             TRUE
           }, error = function(e) {
-            showNotification(paste("Render failed for", a, ":", e$message), type = "error", duration = 6)
+            showNotification(paste("Render failed for", a, ":", e$message), type = "error", duration = 10)
             FALSE
           })
           
@@ -985,11 +1153,10 @@ server <- function(input, output, session) {
       })
       
       if (length(pdf_files) == 0) {
-        showNotification("No reports were generated.", type = "error", duration = 5)
+        showNotification("No reports were generated.", type = "error", duration = 6)
         stop("no-reports")
       }
       
-      # zip up the tempdir PDFs into the file path provided by Shiny
       if (requireNamespace("zip", quietly = TRUE)) {
         zip::zipr(zipfile = file, files = pdf_files, root = tmpdir)
       } else {
@@ -999,54 +1166,96 @@ server <- function(input, output, session) {
     }
   )
   
-  # ---- Download selected sessions as ONE CSV (progress + robust data pull) ----
+  # ---- Download selected sessions as ONE CSV (from cache or fresh?) ----
+  # To avoid API calls, we can build from cache by keys.
+  # ---- Download selected sessions as ONE CSV (cache-first, with progress) ----
   output$report_csv <- downloadHandler(
     filename = function() paste0(format(Sys.Date(), "%Y-%m-%d"), "_anthro.csv"),
     contentType = "text/csv; charset=utf-8",
     content = function(file) {
+      # 1) Validate selection
       ids <- isolate(input$report_selected)
       if (is.null(ids) || length(ids) == 0) {
         showNotification("Please select at least one row to download.", type = "warning", duration = 4)
         stop("no-selection")
       }
+      
+      # 2) Resolve indices against the visible table
       df <- report_df()
-      n <- nrow(df)
+      n  <- nrow(df)
       sel_idx <- suppressWarnings(as.integer(gsub("^sel_", "", ids)))
       sel_idx <- sel_idx[!is.na(sel_idx) & sel_idx >= 1 & sel_idx <= n]
       if (length(sel_idx) == 0) {
         showNotification("Please select at least one row to download.", type = "warning", duration = 4)
         stop("no-valid-index")
       }
-
+      
+      # Helper: try to pull one row (athlete + date) from the in-memory DB;
+      # fallback to API if cache is missing or empty.
+      pull_one_row <- function(a, d) {
+        fetch_full_session_row(a, d)  # always returns a tibble (maybe 0-row)
+      }
+      
+      # 3) Build the CSV rows
       rows <- list()
       withProgress(message = "Building CSV…", value = 0, {
         total <- length(sel_idx)
         for (k in seq_along(sel_idx)) {
           i <- sel_idx[k]
-          incProgress((k - 1) / max(1, total), detail = sprintf("%s — %s", as.character(df$date[i]), as.character(df$athlete[i])))
           a <- as.character(df$athlete[i])
           d <- as.character(df$date[i])
-          got <- try(api_get(list(action = "get_anthro", athlete = a, date = d, cb = as.integer(Sys.time()))), silent = TRUE)
-          if (!inherits(got, "try-error") && isTRUE(got$ok) && length(got$data) > 0) {
-            dat <- try(tibble::as_tibble(jsonlite::fromJSON(jsonlite::toJSON(got$data))), silent = TRUE)
-            if (!inherits(dat, "try-error") && nrow(dat) > 0) {
-              rows[[length(rows) + 1]] <- dat[1, ]
-            }
+          
+          incProgress((k - 1) / max(1, total),
+                      detail = sprintf("%s — %s", d, a))
+          
+          got_row <- pull_one_row(a, d)
+          if (is.data.frame(got_row) && nrow(got_row) > 0) {
+            rows[[length(rows) + 1]] <- got_row
+          } else {
+            showNotification(sprintf("No data found for %s (%s); skipping.", a, d),
+                             type = "warning", duration = 4)
           }
         }
         incProgress(1, detail = "Finalizing…")
       })
+      
+      # 4) Bind and flatten
+      if (length(rows) == 0) {
+        showNotification("No data found for the selected entries.", type = "error", duration = 5)
+        return(invisible(NULL))
+      }
+      
+      out <- safe_bind_rows(rows)
+      if (nrow(out) > 0) {
+        out <- tibble::as_tibble(
+          jsonlite::fromJSON(jsonlite::toJSON(out, auto_unbox=TRUE, null="null"), flatten=TRUE),
+          .name_repair = "universal"
+        )
+        names(out) <- tolower(names(out))
+        # Common Apps Script / sheet variants → standardize
+        if (!"athlete" %in% names(out)) {
+          if ("athletename" %in% names(out)) out <- dplyr::rename(out, athlete = athletename)
+          if ("name" %in% names(out))        out <- dplyr::rename(out, athlete = name)
+        }
+        if (!"date" %in% names(out)) {
+          if ("collection_date" %in% names(out)) out <- dplyr::rename(out, date = collection_date)
+          if ("session_date" %in% names(out))    out <- dplyr::rename(out, date = session_date)
+        }
+      }
 
-      out <- dplyr::bind_rows(rows)
+      if (!is.data.frame(out) || nrow(out) == 0) {
+        showNotification("No data found for the selected entries.", type = "error", duration = 5)
+        stop("no-rows")
+      }
+      
+      # Flatten nested lists (if any) by JSON round-trip
       out <- tibble::as_tibble(
         jsonlite::fromJSON(jsonlite::toJSON(out, auto_unbox = TRUE, null = "null"),
                            flatten = TRUE),
         .name_repair = "universal"
       )
-      if (nrow(out) == 0) {
-        showNotification("No data found for the selected entries.", type = "error", duration = 5)
-        return(invisible(NULL))
-      }
+      
+      # 5) Write CSV (Excel-friendly, UTF-8 BOM)
       readr::write_excel_csv(out, file, na = "")
     }
   )
