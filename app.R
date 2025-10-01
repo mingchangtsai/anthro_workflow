@@ -379,7 +379,7 @@ ui <- tagList(
             h4("Batch upload"),
             fileInput("batch_file", "Excel (.xlsx) file only", accept = c(".xlsx"),
                       buttonLabel = "Browse..."),
-            actionButton("upload_btn", "Upload to Google Sheet", class = "btn-warning", width = "100%"),
+            actionButton("upload_btn", "Upload to Database", class = "btn-warning", width = "100%"),
             br(),
             textOutput("upload_status"),
             br(),
@@ -1040,7 +1040,7 @@ server <- function(input, output, session) {
       incProgress(0.5, detail = "Normalizing")
       if (!"timestamp" %in% names(df)) df$timestamp <- format(Sys.time(), "%Y-%m-%dT%H:%M:%S%z")
       rows <- jsonlite::fromJSON(jsonlite::toJSON(df, na = "null"), simplifyVector = FALSE)
-      incProgress(0.8, detail = "Saving to Google Sheet")
+      incProgress(0.8, detail = "Saving to Database")
       ok <- append_rows(rows)
       if (ok) {
         # Simple approach: re-hydrate to reflect batch upload
