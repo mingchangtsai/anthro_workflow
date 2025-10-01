@@ -35,6 +35,10 @@ cap_first <- function(s) {
 }
 norm_name <- function(x) tolower(trimws(x))
 
+alpha_sort <- function(x) {
+  x <- unique(na.omit(as.character(x)))
+  x[order(tolower(x))]
+}
 # ---- schema normalizer (make sure we always have athlete + date) ----
 normalize_cols <- function(df) {
   df <- safe_tibble(df)
@@ -132,6 +136,36 @@ fetch_recent <- function(limit = 10) {
     return(tibble::tibble(date = character(), athlete = character()))
   }
   dplyr::select(out, date, athlete) |> dplyr::distinct()
+}
+
+# ---- Do we have more than just athlete/date? ----
+has_measure_cols <- function(df) {
+  if (!is.data.frame(df) || ncol(df) <= 2) return(FALSE)
+  nm <- names(df)
+  any(grepl("(_m1|_m2|_m3|_value|_suggest)$", nm)) ||
+    any(nm %in% c("height_cm_m1","weight_kg_m1","usg","caliper","fasted","birth_control","creatine"))
+}
+
+# ---- History from cache ONLY (no API) ----
+
+# ---- TitleCase aliases so older Rmds still work ----
+make_title_aliases <- function(d) {
+  nm <- names(d)
+  for (nm0 in nm) {
+    alias <- paste0(toupper(substr(nm0, 1, 1)), substring(nm0, 2))
+    if (!identical(alias, nm0) && !(alias %in% nm)) d[[alias]] <- d[[nm0]]
+  }
+  d
+}
+
+# ---- Prefer PDF if TeX exists, else HTML (Connect fallback) ----
+choose_output_format <- function() {
+  if (requireNamespace("tinytex", quietly = TRUE)) {
+    ok <- FALSE
+    try({ ok <- tinytex::is_tinytex() || tinytex::is_tlmgr_ready() }, silent = TRUE)
+    if (isTRUE(ok)) return("pdf_document")
+  }
+  "html_document"
 }
 
 # ================== CHOICES / MEASURES ==================
@@ -284,11 +318,27 @@ ui <- tagList(
       /* Report table width + height */
       #report-wrapper { width: 70%; }
       #report-wrapper .datatables, #report_tbl { max-height: 50vh; overflow-y: auto; }
+      
+      /* Make report table rows ~50% as tall */
+      #report_tbl table.dataTable thead th,
+      #report_tbl table.dataTable thead td,
+      #report_tbl table.dataTable tbody th,
+      #report_tbl table.dataTable tbody td {
+        padding-top: 3px !important;   /* was ~6px */
+        padding-bottom: 3px !important;/* was ~6px */
+        line-height: 1.0 !important;   /* tighten text box */
+      }
+      
+      /* If you also want the 'Select' checkbox column tighter: */
+      #report_tbl input[type=checkbox] {
+        transform: scale(1.0);          /* keep size */
+        margin: 0 !important;           /* remove extra space */
+      }
 
       #recent_tbl table {font-size: 0.85em;} 
       #recent_tbl table th, #recent_tbl table td {font-size: 0.85em;}
       #report_tbl table { font-size: 0.85em; table-layout: fixed; width: 100%; }
-      #report_tbl table th, #report_tbl table td { font-size: 0.85em; padding: 6px 8px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+      #report_tbl table th, #report_tbl table td { font-size: 0.85em; padding: 3px 8px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
       #report_tbl input[type=checkbox] { transform: scale(1.1); }
     "))
   ),
@@ -304,10 +354,16 @@ ui <- tagList(
             width = 3,
             selectizeInput("practitioner", "Practitioner",
                            choices = NULL,
-                           options = list(placeholder = "Type or pick", create = TRUE)),
+                           options = list(placeholder = "Select From List", 
+                                          create = TRUE,
+                                          sortField = list(list(field = "text", direction = "asc"))
+                                          )),
             selectizeInput("athlete", "Athlete name",
                            choices = NULL,
-                           options = list(placeholder = "Type or pick", create = TRUE)),
+                           options = list(placeholder = "Select From List", 
+                                          create = FALSE,
+                                          sortField = list(list(field = "text", direction = "asc"))
+                                          )),
             dateInput("date", "Collection Date", value = Sys.Date()),
             shinyTime::timeInput("time", "Collection Time",
                                  value = strptime(format(Sys.time(), "%I:%M %p"), "%I:%M %p"),
@@ -420,6 +476,21 @@ server <- function(input, output, session) {
       any(nm %in% c("height_cm_m1","weight_kg_m1","usg","caliper","fasted","birth_control","creatine"))
   }
   
+  fetch_history_cache_only <- function(ath) {
+    db <- .DB()
+    if (!is.data.frame(db) || nrow(db) == 0) return(tibble::tibble())
+    target <- tolower(trimws(ath))
+    out <- db %>%
+      dplyr::filter(tolower(trimws(athlete)) == target) %>%
+      tibble::as_tibble()
+    if (nrow(out)) {
+      out <- jsonlite::fromJSON(jsonlite::toJSON(out, auto_unbox = TRUE, null = "null"), flatten = TRUE) |>
+        tibble::as_tibble() |>
+        normalize_cols()
+    }
+    out
+  }
+  
   # Pull a single FULL session row; use API if cache row is skinny
   fetch_full_session_row <- function(a, d) {
     a <- trimws(a); d <- trimws(d)
@@ -512,68 +583,50 @@ server <- function(input, output, session) {
   hydrate_full_db <- function(limit = 5000) {
     withProgress(message = "Downloading database…", value = 0, {
       incProgress(0.1, detail = "Fetching index")
-      idx <- fetch_recent(limit)
-      idx <- normalize_cols(idx)
+      idx <- fetch_recent(limit) |> normalize_cols()
       
-      # If the index has the two key columns, push it into the cache immediately
-      # so Recent/Report can render even if enrichment fails.
+      # 3.1 Save INDEX (for tables) even if enrichment fails
       if (is.data.frame(idx) && nrow(idx) > 0 && all(c("athlete","date") %in% names(idx))) {
-        # Keep only distinct pairs to keep cache light
-        .DB(idx %>% dplyr::distinct(athlete, date))
-        .DB_meta(list(last_loaded = Sys.time()))
+        idx <- dplyr::distinct(idx, athlete, date)
+        .IDX(idx)
       } else {
+        .IDX(tibble::tibble())
         .DB(tibble::tibble())
         .DB_meta(list(last_loaded = Sys.time()))
         showNotification("Index from API didn’t include 'athlete' and 'date' (or was empty).", type = "error", duration = 6)
-        return(invisible(NULL))  # no index → nothing more to do
-      }
-      
-      # Try to enrich with full rows (sequential, no future)
-      incProgress(0.2, detail = "Fetching session rows")
-      
-      pairs <- idx %>%
-        dplyr::distinct(athlete, date) %>%
-        dplyr::arrange(dplyr::desc(date))
-      
-      n <- nrow(pairs)
-      if (n == 0) {
-        incProgress(1, detail = "Done")
         return(invisible(NULL))
       }
       
+      # 3.2 Enrich (fetch full session rows) — no futures, keep Connect-friendly
+      incProgress(0.25, detail = "Fetching session rows")
+      n <- nrow(idx)
+      if (n == 0) { .DB(tibble()); .DB_meta(list(last_loaded = Sys.time())); return(invisible(NULL)) }
+      
       rows <- vector("list", n)
       fetched <- 0
-      
-      # chunking just to show progress nicely
       chunks <- split(seq_len(n), ceiling(seq_len(n) / 25))
-      for (chunk in chunks) {
-        res <- lapply(chunk, function(i) {
-          a <- as.character(pairs$athlete[i])
-          d <- as.character(pairs$date[i])
-          # get_session_row should already return tibble() on failure
-          get_session_row(a, d)
+      for (ch in chunks) {
+        res <- lapply(ch, function(i) {
+          a <- as.character(idx$athlete[i]); d <- as.character(idx$date[i])
+          get_session_row(a, d)  # returns tibble() on failure
         })
-        rows[chunk] <- res
-        fetched <- fetched + length(chunk)
-        incProgress(0.2 + 0.75 * (fetched / n), detail = sprintf("Sessions %d/%d", fetched, n))
+        rows[ch] <- res
+        fetched <- fetched + length(ch)
+        incProgress(0.25 + 0.7 * (fetched / n), detail = sprintf("Sessions %d/%d", fetched, n))
       }
       
       out <- safe_bind_rows(rows)
-      
-      # If enrichment produced data, flatten+normalize and cache; otherwise we keep the index-only cache.
       if (is.data.frame(out) && nrow(out) > 0) {
-        out <- tibble::as_tibble(
-          jsonlite::fromJSON(jsonlite::toJSON(out, auto_unbox = TRUE, null = "null"), flatten = TRUE),
-          .name_repair = "universal"
-        )
-        out <- normalize_cols(out)
+        out <- jsonlite::fromJSON(jsonlite::toJSON(out, auto_unbox = TRUE, null = "null"), flatten = TRUE) |>
+          tibble::as_tibble() |>
+          normalize_cols()
         .DB(out)
-        .DB_meta(list(last_loaded = Sys.time()))
       } else {
-        # keep the index-only cache; still usable for Recent/Report UI
-        showNotification("Could not enrich sessions; showing index list only.", type = "warning", duration = 6)
+        .DB(tibble::tibble())  # keep index-only; tables still render from .IDX
+        # showNotification("Could not enrich sessions; showing index list only.", type = "warning", duration = 1)
       }
       
+      .DB_meta(list(last_loaded = Sys.time()))
       incProgress(1, detail = "Done")
     })
   }
@@ -585,8 +638,12 @@ server <- function(input, output, session) {
       hydrate_full_db(limit = 5000)
       
       incProgress(0.7, detail = 'Loading dropdowns')
-      updateSelectizeInput(session, "practitioner", choices = load_practitioners(), server = TRUE)
-      updateSelectizeInput(session, "athlete", choices = load_athletes(), server = TRUE)
+      updateSelectizeInput(session, "practitioner", 
+                           choices = alpha_sort(load_practitioners()), 
+                           selected = character(0), server = TRUE)
+      updateSelectizeInput(session, "athlete", 
+                           choices = alpha_sort(load_athletes()), 
+                           selected = character(0), server = TRUE)
       incProgress(1, detail = 'Ready')
     })
   }, once = TRUE)
@@ -981,12 +1038,12 @@ server <- function(input, output, session) {
   # ================== REPORT TAB ==================
   # Use cache for report listing (most recent first)
   report_df <- reactive({
-    db <- .DB()
-    if (!is.data.frame(db) || nrow(db) == 0 || !all(c("date","athlete") %in% names(db))) {
+    idx <- .IDX()
+    if (!is.data.frame(idx) || nrow(idx) == 0 || !all(c("date","athlete") %in% names(idx))) {
       return(tibble(date = character(), athlete = character(), timestamp = character()))
     }
-    has_ts <- "timestamp" %in% names(db)
-    db %>%
+    has_ts <- "timestamp" %in% names(idx)
+    idx %>%
       transmute(
         date = as.character(date),
         athlete = as.character(athlete),
@@ -1087,11 +1144,11 @@ server <- function(input, output, session) {
     out
   }
   
-  # ---- Print Report(s) -> ZIP of PDFs (reads from cache) ----
   output$report_print_zip <- downloadHandler(
     filename = function() paste0(format(Sys.Date(), "%Y-%m-%d"), "_anthro_report.zip"),
     contentType = "application/zip",
     content = function(file) {
+      # --- selection sanity ---
       ids <- isolate(input$report_selected)
       if (is.null(ids) || length(ids) == 0) {
         showNotification("Please select at least one row to print.", type = "warning", duration = 4)
@@ -1106,29 +1163,61 @@ server <- function(input, output, session) {
         stop("no-valid-index")
       }
       
+      # --- template check ---
       if (!file.exists("anthro_report_PDF.Rmd")) {
-        showNotification("Template 'anthro_report_PDF.Rmd' not found in app directory.", type = "error", duration = 6)
+        showNotification("Template 'anthro_report_PDF.Rmd' not found in app directory.", type = "error", duration = 8)
         stop("missing-template")
       }
       
+      # --- helpers available inside server() ---
+      have_measure_cols <- function(d) {
+        if (!is.data.frame(d) || ncol(d) <= 2) return(FALSE)
+        nm <- names(d)
+        any(grepl("(_m1|_m2|_m3|_value|_suggest)$", nm)) ||
+          any(nm %in% c("height_cm_m1","weight_kg_m1","usg","caliper","fasted","birth_control","creatine"))
+      }
+      choose_output_format <- function() {
+        if (requireNamespace("tinytex", quietly = TRUE)) {
+          ok <- FALSE
+          try({ ok <- tinytex::is_tinytex() || tinytex::is_tlmgr_ready() }, silent = TRUE)
+          if (isTRUE(ok)) return("pdf_document")
+        }
+        "html_document"
+      }
+      make_title_aliases <- function(d) {
+        nm <- names(d)
+        for (nm0 in nm) {
+          alias <- paste0(toupper(substr(nm0, 1, 1)), substring(nm0, 2))
+          if (!identical(alias, nm0) && !(alias %in% nm)) d[[alias]] <- d[[nm0]]
+        }
+        d
+      }
+      
       tmpdir <- tempfile("anthro_pdf_"); dir.create(tmpdir, showWarnings = FALSE, recursive = TRUE)
-      pdf_files <- character(0)
+      out_files <- character(0)
       
       withProgress(message = "Rendering reports…", value = 0, {
         total <- length(sel_idx)
         for (k in seq_along(sel_idx)) {
           i <- sel_idx[k]
           a <- as.character(df$athlete[i])
+          d <- as.character(df$date[i])
+          incProgress((k - 1) / max(1, total), detail = sprintf("%s — %s", d, a))
           
-          incProgress((k - 1) / max(1, total), detail = sprintf("Preparing %s…", a))
-          
-          hist <- fetch_history_hybrid(a)
-          if (!is.data.frame(hist) || nrow(hist) == 0) {
-            showNotification(paste0("No data found for ", a, "; skipping."), type = "warning", duration = 4)
+          # ---- 1) cache-first history ----
+          hist <- fetch_history_cache_only(a)
+          # If cache has nothing or only skinny index, try to enrich once (hybrid/API)
+          if (!is.data.frame(hist) || nrow(hist) == 0 || !have_measure_cols(hist)) {
+            hist <- fetch_history_hybrid(a)
+          }
+          # If still nothing useful, skip
+          if (!is.data.frame(hist) || nrow(hist) == 0 || !have_measure_cols(hist)) {
+            showNotification(sprintf("No usable data in cache for %s; skipping.", a),
+                             type = "warning", duration = 5)
             next
           }
           
-          # Normalize + alias for Rmd compatibility
+          # ---- 2) normalize for Rmd ----
           names(hist) <- tolower(names(hist))
           hist <- make_title_aliases(hist)
           if (!("athletename" %in% names(hist))) hist$athletename <- hist$athlete %||% NA_character_
@@ -1144,7 +1233,8 @@ server <- function(input, output, session) {
           
           fmt <- choose_output_format()
           out_ext <- if (fmt == "pdf_document") ".pdf" else ".html"
-          outname <- paste0(safe_file(a), "_", format(Sys.Date(), "%Y-%m-%d"), out_ext)
+          base <- paste0(safe_file(a), "_", format(Sys.Date(), "%Y-%m-%d"))
+          outname <- paste0(base, out_ext)
           outpath <- file.path(tmpdir, outname)
           
           ok <- tryCatch({
@@ -1154,7 +1244,7 @@ server <- function(input, output, session) {
               output_file   = outname,
               output_dir    = tmpdir,
               envir         = renv,
-              quiet         = FALSE,
+              quiet         = TRUE,
               clean         = TRUE
             )
             TRUE
@@ -1163,27 +1253,55 @@ server <- function(input, output, session) {
             FALSE
           })
           
-          if (ok && file.exists(outpath)) pdf_files <- c(pdf_files, outpath)
-        }
+          # ---- 3) ensure PDF even when TeX is absent (HTML->PDF via pagedown) ----
+          if (ok && file.exists(outpath)) {
+            if (identical(fmt, "pdf_document")) {
+              out_files <- c(out_files, outpath)
+            } else {
+              # Try to convert HTML to PDF
+              pdf_path <- file.path(tmpdir, paste0(base, ".pdf"))
+              conv_ok <- FALSE
+              if (requireNamespace("pagedown", quietly = TRUE)) {
+                conv_ok <- isTRUE(try({
+                  pagedown::chrome_print(input = outpath, output = pdf_path); file.exists(pdf_path)
+                }, silent = TRUE))
+              }
+              if (conv_ok) {
+                out_files <- c(out_files, pdf_path)
+                # Optionally remove the html if you don’t want it in the zip
+                try(unlink(outpath), silent = TRUE)
+              } else {
+                showNotification(sprintf("Converted HTML report for %s was not produced; keeping HTML.", a),
+                                 type = "warning", duration = 6)
+                # If you strictly want PDFs only, do not add the HTML.
+                # If you prefer to include HTML when PDF fails, uncomment below:
+                # out_files <- c(out_files, outpath)
+              }
+            }
+          } else {
+            showNotification(sprintf("Render did not produce a file for %s; skipping.", a),
+                             type = "error", duration = 6)
+          }
+        } # for each selection
         incProgress(1, detail = "Packaging ZIP…")
-      })
+      }) # withProgress
       
-      if (length(pdf_files) == 0) {
-        showNotification("No reports were generated.", type = "error", duration = 6)
+      if (length(out_files) == 0) {
+        showNotification("No reports were generated (cache empty or render failed).", type = "error", duration = 8)
         stop("no-reports")
       }
       
+      # --- zip only the PDFs ---
       if (requireNamespace("zip", quietly = TRUE)) {
-        zip::zipr(zipfile = file, files = pdf_files, root = tmpdir)
+        zip::zipr(zipfile = file, files = out_files, root = tmpdir)
       } else {
         oldwd <- getwd(); setwd(tmpdir); on.exit(setwd(oldwd), add = TRUE)
-        utils::zip(zipfile = file, files = basename(pdf_files))
+        utils::zip(zipfile = file, files = basename(out_files))
       }
     }
   )
   
-  # ---- Download selected sessions as ONE CSV (from cache or fresh?) ----
-  # To avoid API calls, we can build from cache by keys.
+  
   # ---- Download selected sessions as ONE CSV (cache-first, with progress) ----
   output$report_csv <- downloadHandler(
     filename = function() paste0(format(Sys.Date(), "%Y-%m-%d"), "_anthro.csv"),
