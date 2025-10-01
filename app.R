@@ -587,8 +587,10 @@ server <- function(input, output, session) {
       
       # 3.1 Save INDEX (for tables) even if enrichment fails
       if (is.data.frame(idx) && nrow(idx) > 0 && all(c("athlete","date") %in% names(idx))) {
-        idx <- dplyr::distinct(idx, athlete, date)
-        .IDX(idx)
+        idx2 <- idx %>% dplyr::distinct(athlete, date) %>% dplyr::arrange(dplyr::desc(as.character(date)))
+        .IDX(idx2)
+        .DB(idx2)
+        .DB_meta(list(last_loaded = Sys.time()))
       } else {
         .IDX(tibble::tibble())
         .DB(tibble::tibble())
@@ -821,25 +823,32 @@ server <- function(input, output, session) {
   observeEvent(input$prefill_btn, {
     withProgress(message = 'Prefilling…', value = 0, {
       req(input$athlete)
-      db <- .DB()
+      ath <- trimws(input$athlete)
       
-      validate(
-        need(is.data.frame(db) && nrow(db) > 0, "No entries in local cache yet. Click Reload list, or add data first."),
-        need("athlete" %in% names(db), "Cache doesn’t include an 'athlete' column. Try Reload list.")
-      )
-      
-      target <- norm_name(input$athlete)
-      rdf2 <- db %>% mutate(`_ath` = tolower(trimws(athlete))) %>% filter(`_ath` == target)
-      validate(need(nrow(rdf2) > 0, "No entries in local cache for this athlete. Try Reload list."))
-      
-      row <- if ("timestamp" %in% names(rdf2)) {
-        rdf2 %>% arrange(desc(timestamp)) %>% slice(1)
-      } else {
-        rdf2 %>% arrange(desc(as.Date(date))) %>% slice(1)
+      # 1) figure out most-recent date for this athlete from the hydrated index
+      dates <- athlete_dates_from_index(ath)
+      if (length(dates) == 0) {
+        showNotification("No cached sessions found for this athlete. Try Reload list.", type = "warning", duration = 5)
+        return(invisible(NULL))
       }
+      # dates already sorted desc in athlete_dates_from_index()
+      d_latest <- as.character(dates[[1]])
       
-      if ("practitioner" %in% names(row)) updateSelectizeInput(session, "practitioner", selected = row$practitioner)
-      updateSelectizeInput(session, "athlete", selected = input$athlete)
+      incProgress(0.4, detail = sprintf("Fetching %s (%s)…", ath, d_latest))
+      
+      # 2) pull a FULL row (uses cache first; falls back to API)
+      row <- fetch_full_session_row(ath, d_latest)
+      if (!is.data.frame(row) || nrow(row) == 0) {
+        showNotification("Could not load the latest session details.", type = "error", duration = 5)
+        return(invisible(NULL))
+      }
+      row <- row[1, , drop = FALSE]       # just in case
+      row <- normalize_cols(row)
+      
+      # 3) fill the simple fields
+      if ("practitioner" %in% names(row)) updateSelectizeInput(session, "practitioner", selected = row$practitioner %||% "")
+      updateSelectizeInput(session, "athlete", selected = ath)
+      
       if ("date" %in% names(row)) {
         d_try <- suppressWarnings(lubridate::ymd(row$date))
         if (is.na(d_try)) d_try <- suppressWarnings(lubridate::ymd_hms(row$date))
@@ -850,15 +859,16 @@ server <- function(input, output, session) {
         if (!is.na(t_try)) shinyTime::updateTimeInput(session, "time",
                                                       value = strptime(format(t_try, "%I:%M %p"), "%I:%M %p"))
       }
-      if ("scale" %in% names(row))    updatePickerInput(session, "scale", selected = row$scale)
-      if ("fasted" %in% names(row))   updatePrettyRadioButtons(session, "fasted", selected = row$fasted)
-      if ("day_of_cycle" %in% names(row)) updatePickerInput(session, "doc", selected = as.character(row$day_of_cycle))
-      if ("birth_control" %in% names(row)) updatePrettyRadioButtons(session, "bc", selected = row$birth_control)
-      if ("creatine" %in% names(row)) updatePrettyRadioButtons(session, "creatine", selected = row$creatine)
-      if ("usg" %in% names(row))      updateNumericInput(session, "usg", value = suppressWarnings(as.numeric(row$usg)))
-      if ("caliper" %in% names(row))  updatePickerInput(session, "caliper", selected = row$caliper)
-      if ("comments" %in% names(row)) updateTextAreaInput(session, "comments", value = row$comments %||% "")
+      if ("scale" %in% names(row))        updatePickerInput(session, "scale", selected = row$scale %||% "")
+      if ("fasted" %in% names(row))       updatePrettyRadioButtons(session, "fasted", selected = row$fasted %||% "")
+      if ("day_of_cycle" %in% names(row)) updatePickerInput(session, "doc", selected = as.character(row$day_of_cycle %||% "Not Tracking"))
+      if ("birth_control" %in% names(row))updatePrettyRadioButtons(session, "bc", selected = row$birth_control %||% "")
+      if ("creatine" %in% names(row))     updatePrettyRadioButtons(session, "creatine", selected = row$creatine %||% "")
+      if ("usg" %in% names(row))          updateNumericInput(session, "usg", value = suppressWarnings(as.numeric(row$usg)))
+      if ("caliper" %in% names(row))      updatePickerInput(session, "caliper", selected = row$caliper %||% "")
+      if ("comments" %in% names(row))     updateTextAreaInput(session, "comments", value = row$comments %||% "")
       
+      # 4) fill the measure triplicates
       for (cat in names(measures_list)) {
         items <- measures_list[[cat]]
         for (i in seq_along(items)) {
@@ -867,25 +877,33 @@ server <- function(input, output, session) {
           id1 <- paste0("m1_", base)
           id2 <- paste0("m2_", base)
           id3 <- paste0("m3_", base)
+          
           key <- measure_key[[meas]]
           if (is.null(key)) next
+          
           m1_col <- paste0(key, "_m1")
           m2_col <- paste0(key, "_m2")
           m3_col <- paste0(key, "_m3")
+          
           v1 <- if (m1_col %in% names(row)) suppressWarnings(as.numeric(row[[m1_col]])) else NA_real_
           v2 <- if (m2_col %in% names(row)) suppressWarnings(as.numeric(row[[m2_col]])) else NA_real_
           v3 <- if (m3_col %in% names(row)) suppressWarnings(as.numeric(row[[m3_col]])) else NA_real_
+          
+          # enforce bounds before updating
           bnds <- bounds_for(cat, meas); lo <- bnds[1]; hi <- bnds[2]
           if (!is.na(v1) && (v1 < lo || v1 > hi)) v1 <- NA_real_
           if (!is.na(v2) && (v2 < lo || v2 > hi)) v2 <- NA_real_
           if (!is.na(v3) && (v3 < lo || v3 > hi)) v3 <- NA_real_
+          
           if (!is.null(input[[id1]])) updateNumericInput(session, id1, value = v1)
           if (!is.null(input[[id2]])) updateNumericInput(session, id2, value = v2)
           if (!is.null(input[[id3]])) updateNumericInput(session, id3, value = v3)
         }
       }
+      
+      incProgress(1, detail = 'Done')
     })
-    showNotification(glue("Prefilled data for {input$athlete}."), type="message", duration=5)
+    showNotification(glue("Prefilled latest session for {input$athlete}."), type="message", duration=5)
   })
   
   # ---------- Assemble wide row ----------
