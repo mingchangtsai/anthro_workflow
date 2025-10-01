@@ -741,6 +741,32 @@ server <- function(input, output, session) {
     }, ignoreInit = TRUE)
   }
   
+  # --- validate only when the user leaves the field (on blur) ---
+  register_blur_guard <- function(id, lo, hi, label = "Value") {
+    blur_id <- paste0(id, "_blur")
+    
+    # When the JS blur event fires, we receive the committed value here:
+    observeEvent(input[[blur_id]], {
+      v <- suppressWarnings(as.numeric(input[[blur_id]]))
+      if (!is.null(v) && !is.na(v) && (v < lo || v > hi)) {
+        showNotification(glue("{label} must be between {lo} and {hi}."), type = "error", duration = 3)
+        updateNumericInput(session, id, value = NA)
+      } else {
+        # Keep exactly what the user committed (coerced to numeric)
+        if (!is.na(v)) updateNumericInput(session, id, value = v)
+      }
+    }, ignoreInit = TRUE)
+    
+    # Attach a one-time JS listener to the numericInput's <input> element
+    shinyjs::runjs(sprintf("
+    $(document).off('blur', '#%s input');      // avoid duplicate bindings
+    $(document).on('blur', '#%s input', function(){
+      var val = $(this).val();
+      Shiny.setInputValue('%s', val, {priority:'event'});
+    });
+  ", id, id, blur_id))
+  }
+  
   build_row <- function(category, item, idx) {
     base <- paste0(safe_id(category), "_", safe_id(item), "_", idx)
     id1 <- paste0("m1_", base)
@@ -766,9 +792,9 @@ server <- function(input, output, session) {
       if (is.na(vv)) span(class="muted","—") else span(class="value-box", sprintf("%.2f", vv))
     })
     
-    register_guard(id1, lo, hi, "Measure 1")
-    register_guard(id2, lo, hi, "Measure 2")
-    register_guard(id3, lo, hi, "Measure 3")
+    register_blur_guard(id1, lo, hi, "Measure 1")
+    register_blur_guard(id2, lo, hi, "Measure 2")
+    register_blur_guard(id3, lo, hi, "Measure 3")
     
     div(class="row-line measure-row",
         div(class="seg-name", div(style="padding-top:6px;", cap_first(item))),
@@ -965,31 +991,23 @@ server <- function(input, output, session) {
       return(NULL)
     }
     
-    # Check duplicate in local cache
+    # --- Duplicate check (robust) ---
     db_now <- .DB()
-    dup_exists <- nrow(db_now %>%
-                         filter(tolower(trimws(athlete)) == tolower(trimws(out$athlete)),
-                                as.character(date) == as.character(out$date))) > 0
-    if (dup_exists) {
-      pending_row(out)
-      showModal(modalDialog(
-        title = "Duplicate found",
-        size = "m",
-        easyClose = FALSE,
-        footer = tagList(
-          actionButton("confirm_replace", "Overwrite existing record", class = "btn-danger"),
-          modalButton("Cancel")
-        ),
-        div(
-          p("An entry already exists for:"),
-          tags$ul(
-            tags$li(glue("Athlete: {out$athlete}")),
-            tags$li(glue("Collection Date: {out$date}"))
-          ),
-          p("Do you want to overwrite the existing record with your current data?")
+    
+    # always coerce the outgoing date to a comparable character
+    out_date_chr <- as.character(out$date %||% "")
+    
+    dup_exists <- FALSE
+    if (is.data.frame(db_now) && nrow(db_now) > 0) {
+      # use .data pronoun so we definitely hit columns, not functions
+      dup_exists <- dbplyr::remote_query  # no-op keep? (ignore if not using dbplyr)
+      dup_exists <- nrow(
+        dplyr::filter(
+          db_now,
+          tolower(trimws(.data$athlete)) == tolower(trimws(out$athlete)),
+          as.character(.data$date) == out_date_chr
         )
-      ))
-      return(invisible(NULL))
+      ) > 0
     }
     
     ok <- isTRUE(append_rows(list(out)))
@@ -1014,7 +1032,7 @@ server <- function(input, output, session) {
       # drop old (athlete, date) then prepend normalized new row
       db_now2 <- db_now %>%
         dplyr::filter(!(tolower(trimws(athlete)) == tolower(trimws(out$athlete)) &
-                          as.character(date) == as.character(out$date)))
+                          as.character(.data$date) == out_date_chr))
       new_row <- tibble::as_tibble(jsonlite::fromJSON(jsonlite::toJSON(out), flatten = TRUE))
       new_row <- normalize_cols(new_row)
       .DB(bind_rows(new_row, db_now2))
