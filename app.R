@@ -1032,8 +1032,17 @@ server <- function(input, output, session) {
       db_now <- .DB()
       .DB(bind_rows(new_row, db_now))
       idx_now <- .IDX()
-      new_idx <- tibble::tibble(athlete = as.character(out$athlete), date = as.character(out$date))
+      new_idx <- tibble::tibble(athlete = as.character(out$athlete), date = as.character(out$date), timestamp = as.character(out$timestamp %||% out$date))
       .IDX(dplyr::bind_rows(new_idx, safe_tibble(idx_now)) %>% dplyr::distinct(athlete, date) %>% dplyr::arrange(dplyr::desc(as.Date(as.character(date)))))
+      # Force the Recent 10 table to refresh
+      try({
+        df2 <- recent_from_cache() %>%
+          dplyr::select(date, athlete) %>%
+          dplyr::rename(Date = date, Athlete = athlete)
+        
+        proxy <- DT::dataTableProxy("recent_tbl")
+        DT::replaceData(proxy, df2, resetPaging = TRUE, rownames = FALSE)
+      }, silent = TRUE)
       output$status <- renderText("Saved to database")
     } else {
       # show message from server/transport
@@ -1062,13 +1071,23 @@ server <- function(input, output, session) {
       idx_now <- .IDX()
       new_idx <- tibble::tibble(
         athlete = as.character(out$athlete),
-        date    = as.character(out$date)
+        date = as.character(out$date),
+        timestamp = as.character(out$timestamp %||% out$date)
       )
       .IDX(
         dplyr::bind_rows(new_idx, safe_tibble(idx_now)) %>%
           dplyr::distinct(athlete, date) %>%
           dplyr::arrange(dplyr::desc(as.Date(as.character(date))))
       )
+      # Force the Recent 10 table to refresh
+      try({
+        df2 <- recent_from_cache() %>%
+          dplyr::select(date, athlete) %>%
+          dplyr::rename(Date = date, Athlete = athlete)
+        
+        proxy <- DT::dataTableProxy("recent_tbl")
+        DT::replaceData(proxy, df2, resetPaging = TRUE, rownames = FALSE)
+      }, silent = TRUE)
       output$status <- renderText("Existing record overwritten and saved to database")
       pending_row(NULL)
     } else {
