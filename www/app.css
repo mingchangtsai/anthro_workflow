@@ -1,0 +1,124 @@
+/* ===== Global / layout ===== */
+.navbar-nav > li > a {
+  font-size: 18px;
+  font-weight: 700;
+}
+body { overflow-y: auto; }
+
+/* ===== Card styling ===== */
+.card {
+  border: 1px solid #e5e7eb;
+  border-radius: 12px;
+  padding: 16px;
+  margin-bottom: 18px;
+  box-shadow: 0 1px 3px rgba(0,0,0,0.04);
+  overflow: visible;
+}
+
+/* ===== Brand header ===== */
+.brand-header {
+  background: #000;
+  color: #fff;
+  padding: 14px 18px;
+}
+.brand-header-title {
+  font-weight: 900;
+  color: #fff;
+  font-size: 40px;
+  letter-spacing: 0.4px;
+}
+
+/* ===== Utility / typography ===== */
+.row-head {
+  font-weight: 600;
+  color: #374151;
+  padding: 4px 0 8px 0;
+}
+.row-line {
+  border-bottom: 1px dashed #e5e7eb;
+  margin-bottom: 6px;
+  padding-bottom: 6px;
+}
+.value-box { font-weight: 600; }
+.muted { color: #6b7280; }
+.warn { color: #b91c1c; font-size: 0.92em; }
+
+/* ===== Numeric input: remove spinners ===== */
+input[type=number]::-webkit-outer-spin-button,
+input[type=number]::-webkit-inner-spin-button {
+  -webkit-appearance: none;
+  margin: 0;
+}
+input[type=number] { -moz-appearance: textfield; }
+
+/* Tighter numeric box */
+.mini-num input.form-control {
+  max-width: 100%;
+  overflow: hidden;
+}
+
+/* ===== Measures grid ===== */
+.measure-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+}
+.seg-name  { flex: 0 0 25%; }
+.seg-in    { flex: 0 0 12.5%; }
+.seg-sugg  { flex: 0 0 25%; }
+.seg-val   { flex: 0 0 12.5%; }
+
+/* ===== Recent table (smaller text) ===== */
+#recent_tbl table { font-size: 0.85em; }
+#recent_tbl table th,
+#recent_tbl table td { font-size: 0.85em; }
+
+/* ===== Report wrapper ===== */
+#report-wrapper { width: 70%; }
+#report-wrapper .datatables,
+#report_tbl { max-height: 50vh; overflow-y: auto; }
+
+/* ===== Report table base ===== */
+#report_tbl table {
+  font-size: 0.85em;
+  table-layout: fixed;
+  width: 100%;
+}
+#report_tbl table th,
+#report_tbl table td {
+  font-size: 0.85em;
+  padding: 6px 8px;             /* base padding; overridden below for compact rows */
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* ===== Compact report rows (~50% height) =====
+   Tighten vertical rhythm while keeping readability */
+#report_tbl table.dataTable thead th,
+#report_tbl table.dataTable thead td,
+#report_tbl table.dataTable tbody th,
+#report_tbl table.dataTable tbody td {
+  padding-top: 3px !important;    /* was ~6px */
+  padding-bottom: 3px !important; /* was ~6px */
+  line-height: 1.0 !important;
+}
+
+/* Checkbox column spacing */
+#report_tbl input[type=checkbox] {
+  transform: scale(1.1);
+  margin: 0 !important;
+}
+
+/* ===== Selectize placeholders (ensure visible) ===== */
+.selectize-control.single .selectize-input.has-placeholder .item,
+.selectize-control.single .selectize-input input[placeholder] {
+  color: #9ca3af; /* neutral gray */
+}
+
+/* ===== Buttons alignment (optional minor nicety) ===== */
+.btn-outline-secondary,
+.btn-primary,
+.btn-warning {
+  font-weight: 600;
+}

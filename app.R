@@ -35,6 +35,51 @@ cap_first <- function(s) {
 }
 norm_name <- function(x) tolower(trimws(x))
 
+# ---- tolerant coercion helpers ----
+as_chr1 <- function(x) {
+  if (is.list(x)) {
+    vapply(x, function(v) if (length(v) == 0 || is.null(v)) NA_character_ else as.character(v[[1]]),
+           character(1))
+  } else as.character(x)
+}
+
+# Accept both named rows and positional arrays
+rows_list_to_tibble <- function(x) {
+  if (is.null(x)) return(tibble::tibble())
+  purrr::map_dfr(x, function(r) {
+    if (is.list(r) && length(names(r))) {
+      d <- r
+      date  <- d$date %||% d$collection_date %||% d$session_date %||% d$timestamp
+      name  <- d$athlete %||% d$athletename %||% d$name
+      ts    <- d$timestamp %||% d$date
+      tibble::tibble(
+        date      = as_chr1(date),
+        athlete   = as_chr1(name),
+        timestamp = as_chr1(ts)
+      )
+    } else {
+      v <- unlist(r, recursive = FALSE, use.names = FALSE)
+      tibble::tibble(
+        date      = as_chr1(if (length(v) >= 1) v[[1]] else NA_character_),
+        athlete   = as_chr1(if (length(v) >= 2) v[[2]] else NA_character_),
+        timestamp = as_chr1(if (length(v) >= 3) v[[3]] else NA_character_)
+      )
+    }
+  })
+}
+
+# Normalize col names + types (flattens list -> chr)
+fix_ad_cols <- function(df) {
+  df <- tibble::as_tibble(df)
+  names(df) <- tolower(names(df))
+  if (!"athlete" %in% names(df)) df$athlete <- NA_character_
+  if (!"date"    %in% names(df)) df$date    <- NA_character_
+  df$athlete <- as_chr1(df$athlete)
+  df$date    <- as_chr1(df$date)
+  if ("timestamp" %in% names(df)) df$timestamp <- as_chr1(df$timestamp)
+  df
+}
+
 alpha_sort <- function(x) {
   x <- unique(na.omit(as.character(x)))
   x[order(tolower(x))]
@@ -94,19 +139,63 @@ api_get <- function(params = list()) {
   jsonlite::fromJSON(txt, simplifyVector = FALSE)
 }
 
+# Generic POST caller (keeps your diagnostics)
 api_post <- function(body) {
   stopifnot(is.list(body))
   body$key <- API_KEY
   payload <- jsonlite::toJSON(body, auto_unbox = TRUE, null = "null")
-  resp <- httr::POST(
+  
+  resp <- try(httr::POST(
     API_URL,
     body = payload,
     httr::content_type("text/plain; charset=UTF-8"),
     httr::timeout(30)
-  )
-  httr::stop_for_status(resp, task = "POST Apps Script")
-  txt <- httr::content(resp, as = "text", encoding = "UTF-8")
-  jsonlite::fromJSON(txt, simplifyVector = FALSE)
+  ), silent = TRUE)
+  
+  if (inherits(resp, "try-error")) {
+    return(list(ok = FALSE, status_code = NA_integer_, message = as.character(resp), raw = NULL))
+  }
+  
+  status <- httr::status_code(resp)
+  raw <- try(httr::content(resp, as = "text", encoding = "UTF-8"), silent = TRUE)
+  raw <- if (inherits(raw, "try-error")) NULL else raw
+  parsed <- try(jsonlite::fromJSON(raw, simplifyVector = FALSE), silent = TRUE)
+  
+  if (!inherits(parsed, "try-error") && is.list(parsed)) {
+    parsed$status_code <- status
+    parsed$raw <- raw
+    parsed$message <- parsed$message %||% parsed$error %||% paste("HTTP", status)
+    return(parsed)
+  }
+  
+  list(ok = (status >= 200 && status < 300), status_code = status,
+       message = "Non-JSON response", raw = raw)
+}
+
+# Try a sequence of action names until one works
+.try_actions <- function(payload_base, actions) {
+  msgs <- c()
+  raws <- c()
+  for (a in actions) {
+    res <- api_post(c(payload_base, list(action = a)))
+    if (isTRUE(res$ok)) return(list(ok = TRUE, message = res$message %||% paste("ok via", a), raw = res$raw, action = a))
+    msgs <- c(msgs, sprintf("%s → %s", a, res$message %||% "<no message>"))
+    raws <- c(raws, res$raw %||% "<no raw>")
+    # If server said explicitly "unknown action", keep trying; otherwise break early.
+    if (!grepl("unknown action", tolower(res$message %||% ""))) break
+  }
+  list(ok = FALSE, message = paste(msgs, collapse = " | "), raw = paste(raws, collapse = "\n\n"), action = NA_character_)
+}
+
+append_rows <- function(rows_list) {
+  # Try likely Apps Script routes
+  actions <- c("append_rows", "append_anthro", "append", "save_anthro", "save")
+  .try_actions(list(rows = rows_list), actions)
+}
+
+replace_rows_for_key <- function(athlete, date, rows_list) {
+  actions <- c("replace_rows_for_key", "replace_anthro", "overwrite_anthro", "upsert_anthro")
+  .try_actions(list(athlete = athlete, date = date, rows = rows_list), actions)
 }
 
 load_practitioners <- function() {
@@ -130,8 +219,8 @@ fetch_recent <- function(limit = 10) {
   if (inherits(res, "try-error") || !isTRUE(res$ok) || length(res$data) == 0) {
     return(tibble::tibble(date = character(), athlete = character()))
   }
-  out <- tibble::as_tibble(jsonlite::fromJSON(jsonlite::toJSON(res$data)))
-  out <- normalize_cols(out)
+  # tolerant parse + normalize
+  out <- rows_list_to_tibble(res$data) |> fix_ad_cols()
   if (!all(c("date","athlete") %in% names(out))) {
     return(tibble::tibble(date = character(), athlete = character()))
   }
@@ -295,53 +384,7 @@ brand_header <- function() {
 # ================== UI ==================
 ui <- tagList(
   useShinyjs(),
-  tags$head(
-    tags$style(HTML("
-      .navbar-nav > li > a { font-size: 18px; font-weight: 700; }
-      body { overflow-y: auto; }
-      .card { border: 1px solid #e5e7eb; border-radius: 12px; padding: 16px; margin-bottom: 18px; box-shadow: 0 1px 3px rgba(0,0,0,0.04); overflow: visible; }
-      .row-head { font-weight: 600; color: #374151; padding: 4px 0 8px 0; }
-      .row-line { border-bottom: 1px dashed #e5e7eb; margin-bottom: 6px; padding-bottom: 6px; }
-      .value-box { font-weight: 600; }
-      .muted { color: #6b7280; }
-      .warn { color: #b91c1c; font-size: 0.92em; }
-      input[type=number]::-webkit-outer-spin-button,
-      input[type=number]::-webkit-inner-spin-button { -webkit-appearance: none; margin: 0; }
-      input[type=number] { -moz-appearance: textfield; }
-      .mini-num input.form-control { max-width: 100%; overflow: hidden; }
-      .measure-row { display: flex; align-items: flex-start; gap: 8px; }
-      .seg-name { flex: 0 0 25%; }
-      .seg-in { flex: 0 0 12.5%; }
-      .seg-sugg { flex: 0 0 25%; }
-      .seg-val { flex: 0 0 12.5%; }
-
-      /* Report table width + height */
-      #report-wrapper { width: 70%; }
-      #report-wrapper .datatables, #report_tbl { max-height: 50vh; overflow-y: auto; }
-      
-      /* Make report table rows ~50% as tall */
-      #report_tbl table.dataTable thead th,
-      #report_tbl table.dataTable thead td,
-      #report_tbl table.dataTable tbody th,
-      #report_tbl table.dataTable tbody td {
-        padding-top: 3px !important;   /* was ~6px */
-        padding-bottom: 3px !important;/* was ~6px */
-        line-height: 1.0 !important;   /* tighten text box */
-      }
-      
-      /* If you also want the 'Select' checkbox column tighter: */
-      #report_tbl input[type=checkbox] {
-        transform: scale(1.0);          /* keep size */
-        margin: 0 !important;           /* remove extra space */
-      }
-
-      #recent_tbl table {font-size: 0.85em;} 
-      #recent_tbl table th, #recent_tbl table td {font-size: 0.85em;}
-      #report_tbl table { font-size: 0.85em; table-layout: fixed; width: 100%; }
-      #report_tbl table th, #report_tbl table td { font-size: 0.85em; padding: 3px 8px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-      #report_tbl input[type=checkbox] { transform: scale(1.1); }
-    "))
-  ),
+  tags$head(tags$link(rel = "stylesheet", type = "text/css", href = "app.css")),
   brand_header(),
   navbarPage(
     title = NULL,
@@ -420,13 +463,6 @@ ui <- tagList(
     tabPanel(
       title = "Report",
       fluidPage(
-        tags$head(
-          tags$style(HTML("
-            #report_tbl table { font-size: 0.85em; table-layout: fixed; width: 100%; }
-            #report_tbl table th, #report_tbl table td { font-size: 0.85em; padding: 6px 8px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-            #report_tbl input[type=checkbox] { transform: scale(1.1); }
-          "))
-        ),
         fluidRow(
           column(4, actionButton("report_reload", "Reload list", class = "btn-outline-secondary", width = "100%")),
           column(4, actionButton("report_select_all", "Select all", class = "btn-outline-secondary", width = "100%")),
@@ -467,14 +503,6 @@ server <- function(input, output, session) {
   .DB_meta <- reactiveVal(list(last_loaded = NA))
   .session_cache <- cache_mem(max_age = 3600) # per-session fetch cache during hydrate
   .IDX <- reactiveVal(tibble::tibble())  # holds the recent_anthro index used for hydration
-  
-  # Treat a row as "full" (not just athlete/date)
-  has_measure_cols <- function(df) {
-    if (!is.data.frame(df) || ncol(df) <= 2) return(FALSE)
-    nm <- names(df)
-    any(grepl("(_m1|_m2|_m3|_value|_suggest)$", nm)) ||
-      any(nm %in% c("height_cm_m1","weight_kg_m1","usg","caliper","fasted","birth_control","creatine"))
-  }
   
   fetch_history_cache_only <- function(ath) {
     db <- .DB()
@@ -583,19 +611,22 @@ server <- function(input, output, session) {
   hydrate_full_db <- function(limit = 5000) {
     withProgress(message = "Downloading database…", value = 0, {
       incProgress(0.1, detail = "Fetching index")
-      idx <- fetch_recent(limit) |> normalize_cols()
+      idx <- fetch_recent(limit) |> fix_ad_cols()
       
-      # 3.1 Save INDEX (for tables) even if enrichment fails
+      # Save index for Recent/Report immediately so UI has data even if enrichment fails
       if (is.data.frame(idx) && nrow(idx) > 0 && all(c("athlete","date") %in% names(idx))) {
-        idx2 <- idx %>% dplyr::distinct(athlete, date) %>% dplyr::arrange(dplyr::desc(as.character(date)))
+        idx2 <- idx %>%
+          dplyr::distinct(athlete, date) %>%
+          dplyr::arrange(dplyr::desc(as.Date(as.character(date))))
         .IDX(idx2)
-        .DB(idx2)
+        .DB(idx2)  # temporary seed; will be replaced if enrichment succeeds
         .DB_meta(list(last_loaded = Sys.time()))
       } else {
         .IDX(tibble::tibble())
         .DB(tibble::tibble())
         .DB_meta(list(last_loaded = Sys.time()))
-        showNotification("Index from API didn’t include 'athlete' and 'date' (or was empty).", type = "error", duration = 6)
+        showNotification("Index from API didn’t include 'athlete' and 'date' (or was empty).",
+                         type = "error", duration = 6)
         return(invisible(NULL))
       }
       
@@ -659,34 +690,32 @@ server <- function(input, output, session) {
   
   # ---------- Recent list (from cache) ----------
   recent_from_cache <- reactive({
-    db <- .DB()
-    # If full DB is good, use it
-    if (is.data.frame(db) && nrow(db) > 0 && all(c("date","athlete") %in% names(db))) {
-      has_ts <- "timestamp" %in% names(db)
-      return(
-        db %>%
-          transmute(
-            date = as.character(date),
-            athlete = as.character(athlete),
-            ts = if (has_ts) as.character(timestamp) else as.character(date)
-          ) %>%
-          distinct() %>%
-          arrange(desc(ts)) %>%
-          slice_head(n = 10) %>%
-          select(date, athlete)
-      )
-    }
-    # Otherwise, fall back to the index
+    db  <- .DB()
     idx <- .IDX()
-    if (is.data.frame(idx) && nrow(idx) > 0 && all(c("date","athlete") %in% names(idx))) {
-      return(
-        idx %>%
-          transmute(date = as.character(date), athlete = as.character(athlete)) %>%
-          distinct() %>%
-          slice_head(n = 10)
-      )
+    
+    # normalize types BEFORE bind_rows
+    src <- dplyr::bind_rows(
+      fix_ad_cols(safe_tibble(db))  %>% dplyr::select(dplyr::any_of(c("date","athlete","timestamp"))),
+      fix_ad_cols(safe_tibble(idx)) %>% dplyr::select(dplyr::any_of(c("date","athlete","timestamp")))
+    )
+    
+    if (!is.data.frame(src) || nrow(src) == 0) {
+      return(tibble::tibble(date = character(), athlete = character()))
     }
-    tibble::tibble(date = character(), athlete = character())
+    
+    has_ts <- "timestamp" %in% names(src)
+    
+    src %>%
+      dplyr::mutate(
+        date    = as.character(.data$date),
+        athlete = as.character(.data$athlete),
+        ts      = if (has_ts) as.character(.data$timestamp) else as.character(.data$date),
+        date_parsed = suppressWarnings(as.Date(.data$date))
+      ) %>%
+      dplyr::distinct(.data$date, .data$athlete, .keep_all = TRUE) %>%
+      dplyr::arrange(dplyr::desc(.data$ts), dplyr::desc(.data$date_parsed)) %>%
+      dplyr::slice_head(n = 10) %>%
+      dplyr::select(date, athlete)
   })
   
   output$recent_tbl <- renderDT({
@@ -703,44 +732,8 @@ server <- function(input, output, session) {
     }
   })
   
-  # ---------- Debug footer ----------
-  # output$db_debug <- renderText({
-  #   db <- .DB()
-  #   if (!is.data.frame(db) || nrow(db) == 0) {
-  #     return("DB rows: 0\nCols: <none or not loaded>")
-  #   }
-  #   paste0(
-  #     "DB rows: ", nrow(db), "\n",
-  #     "Cols: ", paste(names(db), collapse = ", ")
-  #   )
-  # })
-  # 
-  # output$idx_debug <- renderText({
-  #   idx <- .IDX()
-  #   if (!is.data.frame(idx) || nrow(idx) == 0) return("IDX rows: 0\nCols: <none>")
-  #   paste0("IDX rows: ", nrow(idx), "\nCols: ", paste(names(idx), collapse = ", "))
-  # })
-  # 
-  # output$db_head <- renderText({
-  #   db <- .DB()
-  #   if (!is.data.frame(db) || nrow(db) == 0) return("<empty>")
-  #   # show the first few athlete/date/timestamp rows
-  #   cols <- intersect(c("date","athlete","timestamp"), names(db))
-  #   utils::capture.output(print(utils::head(db[cols], 5)))
-  # })
-  
-  
+
   # ---------- Measures UI ----------
-  register_guard <- function(id, lo, hi, label = "Value") {
-    observeEvent(input[[id]], {
-      v <- input[[id]]
-      if (!is.null(v) && !is.na(v) && (v < lo || v > hi)) {
-        showNotification(glue("{label} must be between {lo} and {hi}."), type = "error", duration = 3)
-        updateNumericInput(session, id, value = NA)
-      }
-    }, ignoreInit = TRUE)
-  }
-  
   # --- validate only when the user leaves the field (on blur) ---
   register_blur_guard <- function(id, lo, hi, label = "Value") {
     blur_id <- paste0(id, "_blur")
@@ -992,7 +985,7 @@ server <- function(input, output, session) {
     }
     
     # --- Duplicate check (robust) ---
-    db_now <- .DB()
+    db_now <- fix_ad_cols(.DB())
     
     # always coerce the outgoing date to a comparable character
     out_date_chr <- as.character(out$date %||% "")
@@ -1000,7 +993,6 @@ server <- function(input, output, session) {
     dup_exists <- FALSE
     if (is.data.frame(db_now) && nrow(db_now) > 0) {
       # use .data pronoun so we definitely hit columns, not functions
-      dup_exists <- dbplyr::remote_query  # no-op keep? (ignore if not using dbplyr)
       dup_exists <- nrow(
         dplyr::filter(
           db_now,
@@ -1010,36 +1002,78 @@ server <- function(input, output, session) {
       ) > 0
     }
     
-    ok <- isTRUE(append_rows(list(out)))
-    if (ok) {
+    if (dup_exists) {
+      pending_row(out)
+      showModal(modalDialog(
+        title = "Duplicate found",
+        size = "m",
+        easyClose = FALSE,
+        footer = tagList(
+          actionButton("confirm_replace", "Overwrite existing record", class = "btn-danger"),
+          modalButton("Cancel")
+        ),
+        div(
+          p("An entry already exists for:"),
+          tags$ul(
+            tags$li(glue("Athlete: {out$athlete}")),
+            tags$li(glue("Collection Date: {out$date}"))
+          ),
+          p("Do you want to overwrite the existing record with your current data?")
+        )
+      ))
+      return(invisible(NULL))
+    }
+    
+    res <- append_rows(list(out))
+    if (isTRUE(res$ok)) {
+      # (unchanged) update .DB, .IDX, status text
       new_row <- tibble::as_tibble(jsonlite::fromJSON(jsonlite::toJSON(out), flatten = TRUE))
       new_row <- normalize_cols(new_row)
       db_now <- .DB()
       .DB(bind_rows(new_row, db_now))
+      idx_now <- .IDX()
+      new_idx <- tibble::tibble(athlete = as.character(out$athlete), date = as.character(out$date))
+      .IDX(dplyr::bind_rows(new_idx, safe_tibble(idx_now)) %>% dplyr::distinct(athlete, date) %>% dplyr::arrange(dplyr::desc(as.Date(as.character(date)))))
       output$status <- renderText("Saved to database")
     } else {
-      output$status <- renderText("Error: could not save to database")
+      # show message from server/transport
+      msg <- paste("Save failed:", res$message %||% "<no message>")
+      output$status <- renderText(msg)
+      # also log full raw body to R console for debugging
+      cat("\n[append_rows] RAW response:\n", res$raw %||% "<no raw>", "\n")
     }
   })
   
   observeEvent(input$confirm_replace, {
     req(!is.null(pending_row()))
     out <- pending_row()
+    out_date_chr <- as.character(out$date %||% "")
     removeModal()
-    ok <- isTRUE(replace_rows_for_key(out$athlete, out$date, list(out)))
-    if (ok) {
+    
+    res <- replace_rows_for_key(out$athlete, out$date, list(out))
+    if (isTRUE(res$ok)) {
       db_now <- .DB()
-      # drop old (athlete, date) then prepend normalized new row
       db_now2 <- db_now %>%
         dplyr::filter(!(tolower(trimws(athlete)) == tolower(trimws(out$athlete)) &
                           as.character(.data$date) == out_date_chr))
       new_row <- tibble::as_tibble(jsonlite::fromJSON(jsonlite::toJSON(out), flatten = TRUE))
       new_row <- normalize_cols(new_row)
       .DB(bind_rows(new_row, db_now2))
+      idx_now <- .IDX()
+      new_idx <- tibble::tibble(
+        athlete = as.character(out$athlete),
+        date    = as.character(out$date)
+      )
+      .IDX(
+        dplyr::bind_rows(new_idx, safe_tibble(idx_now)) %>%
+          dplyr::distinct(athlete, date) %>%
+          dplyr::arrange(dplyr::desc(as.Date(as.character(date))))
+      )
       output$status <- renderText("Existing record overwritten and saved to database")
       pending_row(NULL)
     } else {
-      output$status <- renderText("Error: could not overwrite existing record")
+      output$status <- renderText(paste("Overwrite failed:", res$message %||% "<no message>"))
+      cat("\n[replace_rows_for_key] RAW response:\n", res$raw %||% "<no raw>", "\n")
     }
   })
   
@@ -1131,7 +1165,7 @@ server <- function(input, output, session) {
   
   # ---- Local history helper (from cache) ----
   fetch_athlete_history <- function(ath) {
-    dates <- fetch_dates_for_athlete(ath)
+    dates <- athlete_dates_from_index(ath)
     if (length(dates) == 0) return(tibble())
     
     rows <- lapply(dates, function(d) {
@@ -1206,12 +1240,6 @@ server <- function(input, output, session) {
       }
       
       # --- helpers available inside server() ---
-      have_measure_cols <- function(d) {
-        if (!is.data.frame(d) || ncol(d) <= 2) return(FALSE)
-        nm <- names(d)
-        any(grepl("(_m1|_m2|_m3|_value|_suggest)$", nm)) ||
-          any(nm %in% c("height_cm_m1","weight_kg_m1","usg","caliper","fasted","birth_control","creatine"))
-      }
       choose_output_format <- function() {
         if (requireNamespace("tinytex", quietly = TRUE)) {
           ok <- FALSE
@@ -1242,12 +1270,8 @@ server <- function(input, output, session) {
           
           # ---- 1) cache-first history ----
           hist <- fetch_history_cache_only(a)
-          # If cache has nothing or only skinny index, try to enrich once (hybrid/API)
-          if (!is.data.frame(hist) || nrow(hist) == 0 || !have_measure_cols(hist)) {
-            hist <- fetch_history_hybrid(a)
-          }
           # If still nothing useful, skip
-          if (!is.data.frame(hist) || nrow(hist) == 0 || !have_measure_cols(hist)) {
+          if (!is.data.frame(hist) || nrow(hist) == 0 || !has_measure_cols(hist)) {
             showNotification(sprintf("No usable data in cache for %s; skipping.", a),
                              type = "warning", duration = 5)
             next
@@ -1292,7 +1316,7 @@ server <- function(input, output, session) {
           # ---- 3) ensure PDF even when TeX is absent (HTML->PDF via pagedown) ----
           if (ok && file.exists(outpath)) {
             if (identical(fmt, "pdf_document")) {
-              out_files <- c(out_files, outpath)
+              if (tolower(tools::file_ext(outpath)) == "pdf") out_files <- c(out_files, outpath)
             } else {
               # Try to convert HTML to PDF
               pdf_path <- file.path(tmpdir, paste0(base, ".pdf"))
