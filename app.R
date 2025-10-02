@@ -384,7 +384,12 @@ brand_header <- function() {
 # ================== UI ==================
 ui <- tagList(
   useShinyjs(),
-  tags$head(tags$link(rel = "stylesheet", type = "text/css", href = "app.css")),
+  tags$head(
+    tags$link(rel = "stylesheet", type = "text/css", href = "app.css"),
+    tags$style(HTML("
+      .recalculating { cursor: progress !important; }              
+    "))
+  ),
   brand_header(),
   navbarPage(
     title = NULL,
@@ -972,129 +977,164 @@ server <- function(input, output, session) {
   pending_row <- reactiveVal(NULL)
   
   observeEvent(input$submit, {
-    errs <- c()
-    if (is.null(input$athlete) || !nzchar(trimws(input$athlete))) errs <- c(errs, "Athlete is required.")
-    if (is.null(input$date)) errs <- c(errs, "Collection Date is required.")
-    if (!is.null(input$usg) && !is.na(input$usg) && (input$usg < 0.950 || input$usg > 1.080)) {
-      errs <- c(errs, "USG must be between 0.950 and 1.080.")
-    }
-    out <- assemble_wide()
-    if (length(errs) > 0) {
-      output$status <- renderText(paste(errs, collapse = "\n"))
-      return(NULL)
-    }
+    shinyjs::disable("submit")
+    old_lbl <- isolate({ input$submit }) # just to keep CRAN quiet
+    runjs("$('#submit').text('Saving…');")
     
-    # --- Duplicate check (robust) ---
-    db_now <- fix_ad_cols(.DB())
-    
-    # always coerce the outgoing date to a comparable character
-    out_date_chr <- as.character(out$date %||% "")
-    
-    dup_exists <- FALSE
-    if (is.data.frame(db_now) && nrow(db_now) > 0) {
-      # use .data pronoun so we definitely hit columns, not functions
-      dup_exists <- nrow(
-        dplyr::filter(
-          db_now,
-          tolower(trimws(.data$athlete)) == tolower(trimws(out$athlete)),
-          as.character(.data$date) == out_date_chr
-        )
-      ) > 0
-    }
-    
-    if (dup_exists) {
-      pending_row(out)
-      showModal(modalDialog(
-        title = "Duplicate found",
-        size = "m",
-        easyClose = FALSE,
-        footer = tagList(
-          actionButton("confirm_replace", "Overwrite existing record", class = "btn-danger"),
-          modalButton("Cancel")
-        ),
-        div(
-          p("An entry already exists for:"),
-          tags$ul(
-            tags$li(glue("Athlete: {out$athlete}")),
-            tags$li(glue("Collection Date: {out$date}"))
-          ),
-          p("Do you want to overwrite the existing record with your current data?")
-        )
-      ))
-      return(invisible(NULL))
-    }
-    
-    res <- append_rows(list(out))
-    if (isTRUE(res$ok)) {
-      # (unchanged) update .DB, .IDX, status text
-      new_row <- tibble::as_tibble(jsonlite::fromJSON(jsonlite::toJSON(out), flatten = TRUE))
-      new_row <- normalize_cols(new_row)
+    withProgress(message = "Saving session…", value = 0, {
+      incProgress(0.10, detail = "Validating inputs")
+      errs <- c()
+      if (is.null(input$athlete) || !nzchar(trimws(input$athlete))) errs <- c(errs, "Athlete is required.")
+      if (is.null(input$date)) errs <- c(errs, "Collection Date is required.")
+      if (!is.null(input$usg) && !is.na(input$usg) && (input$usg < 0.950 || input$usg > 1.080)) {
+        errs <- c(errs, "USG must be between 0.950 and 1.080.")
+      }
+      
+      incProgress(0.15, detail = "Assembling row")
+      out <- assemble_wide()
+      
+      if (length(errs) > 0) {
+        output$status <- renderText(paste(errs, collapse = "\n"))
+        incProgress(1, detail = "Aborted")
+        shinyjs::enable("submit"); runjs("$('#submit').text('Submit & Save');")
+        return(invisible(NULL))
+      }
+      
+      # --- Duplicate check (robust) ---
+      incProgress(0.30, detail = "Checking for duplicates")
       db_now <- .DB()
-      .DB(bind_rows(new_row, db_now))
-      idx_now <- .IDX()
-      new_idx <- tibble::tibble(athlete = as.character(out$athlete), date = as.character(out$date), timestamp = as.character(out$timestamp %||% out$date))
-      .IDX(dplyr::bind_rows(new_idx, safe_tibble(idx_now)) %>% dplyr::distinct(athlete, date) %>% dplyr::arrange(dplyr::desc(as.Date(as.character(date)))))
-      # Force the Recent 10 table to refresh
-      try({
-        df2 <- recent_from_cache() %>%
-          dplyr::select(date, athlete) %>%
-          dplyr::rename(Date = date, Athlete = athlete)
+      out_date_chr <- as.character(out$date %||% "")
+      dup_exists <- FALSE
+      if (is.data.frame(db_now) && nrow(db_now) > 0) {
+        dup_exists <- nrow(
+          dplyr::filter(
+            db_now,
+            tolower(trimws(.data$athlete)) == tolower(trimws(out$athlete)),
+            as.character(.data$date) == out_date_chr
+          )
+        ) > 0
+      }
+      
+      if (dup_exists) {
+        incProgress(1, detail = "Awaiting confirmation…")
+        pending_row(out)
+        shinyjs::enable("submit"); runjs("$('#submit').text('Submit & Save');")
+        showModal(modalDialog(
+          title = "Duplicate found",
+          size = "m",
+          easyClose = FALSE,
+          footer = tagList(
+            actionButton("confirm_replace", "Overwrite existing record", class = "btn-danger"),
+            modalButton("Cancel")
+          ),
+          div(
+            p("An entry already exists for:"),
+            tags$ul(
+              tags$li(glue("Athlete: {out$athlete}")),
+              tags$li(glue("Collection Date: {out$date}"))
+            ),
+            p("Do you want to overwrite the existing record with your current data?")
+          )
+        ))
+        return(invisible(NULL))
+      }
+      
+      # --- Save new row ---
+      incProgress(0.60, detail = "Sending to database")
+      ok <- isTRUE(append_rows(list(out)))
+      
+      if (ok) {
+        incProgress(0.85, detail = "Updating cache/index")
+        new_row <- tibble::as_tibble(jsonlite::fromJSON(jsonlite::toJSON(out), flatten = TRUE)) |> normalize_cols()
+        .DB(bind_rows(new_row, .DB()))
+        new_idx <- tibble::tibble(
+          athlete   = as.character(out$athlete),
+          date      = as.character(out$date),
+          timestamp = as.character(out$timestamp %||% out$date)   # ensure recency sort
+        )
+        .IDX(
+          dplyr::bind_rows(new_idx, safe_tibble(.IDX())) %>%
+            dplyr::distinct(athlete, date) %>%
+            dplyr::arrange(dplyr::desc(as.Date(as.character(date))))
+        )
         
-        proxy <- DT::dataTableProxy("recent_tbl")
-        DT::replaceData(proxy, df2, resetPaging = TRUE, rownames = FALSE)
-      }, silent = TRUE)
-      output$status <- renderText("Saved to database")
-    } else {
-      # show message from server/transport
-      msg <- paste("Save failed:", res$message %||% "<no message>")
-      output$status <- renderText(msg)
-      # also log full raw body to R console for debugging
-      cat("\n[append_rows] RAW response:\n", res$raw %||% "<no raw>", "\n")
-    }
+        # force refresh of the “Last 10 entries” table
+        try({
+          df2 <- recent_from_cache() %>%
+            dplyr::select(date, athlete) %>%
+            dplyr::rename(Date = date, Athlete = athlete)
+          proxy <- DT::dataTableProxy("recent_tbl")
+          DT::replaceData(proxy, df2, resetPaging = TRUE, rownames = FALSE)
+        }, silent = TRUE)
+        
+        incProgress(1, detail = "Done")
+        output$status <- renderText("Saved to database")
+      } else {
+        incProgress(1, detail = "Failed")
+        output$status <- renderText("Error: could not save to database")
+      }
+    })
+    
+    shinyjs::enable("submit")
+    runjs("$('#submit').text('Submit & Save');")
   })
+  
   
   observeEvent(input$confirm_replace, {
     req(!is.null(pending_row()))
-    out <- pending_row()
-    out_date_chr <- as.character(out$date %||% "")
-    removeModal()
+    shinyjs::disable("confirm_replace")
+    runjs("$('#confirm_replace').text('Overwriting…');")
     
-    res <- replace_rows_for_key(out$athlete, out$date, list(out))
-    if (isTRUE(res$ok)) {
-      db_now <- .DB()
-      db_now2 <- db_now %>%
-        dplyr::filter(!(tolower(trimws(athlete)) == tolower(trimws(out$athlete)) &
-                          as.character(.data$date) == out_date_chr))
-      new_row <- tibble::as_tibble(jsonlite::fromJSON(jsonlite::toJSON(out), flatten = TRUE))
-      new_row <- normalize_cols(new_row)
-      .DB(bind_rows(new_row, db_now2))
-      idx_now <- .IDX()
-      new_idx <- tibble::tibble(
-        athlete = as.character(out$athlete),
-        date = as.character(out$date),
-        timestamp = as.character(out$timestamp %||% out$date)
-      )
-      .IDX(
-        dplyr::bind_rows(new_idx, safe_tibble(idx_now)) %>%
-          dplyr::distinct(athlete, date) %>%
-          dplyr::arrange(dplyr::desc(as.Date(as.character(date))))
-      )
-      # Force the Recent 10 table to refresh
-      try({
-        df2 <- recent_from_cache() %>%
-          dplyr::select(date, athlete) %>%
-          dplyr::rename(Date = date, Athlete = athlete)
+    withProgress(message = "Overwriting record…", value = 0, {
+      incProgress(0.20, detail = "Preparing data")
+      out <- pending_row()
+      out_date_chr <- as.character(out$date %||% "")
+      removeModal()
+      
+      incProgress(0.60, detail = "Sending to database")
+      ok <- isTRUE(replace_rows_for_key(out$athlete, out$date, list(out)))
+      
+      if (ok) {
+        incProgress(0.85, detail = "Updating cache/index")
+        db_now <- .DB()
+        db_now2 <- db_now %>%
+          dplyr::filter(!(tolower(trimws(athlete)) == tolower(trimws(out$athlete)) &
+                            as.character(.data$date) == out_date_chr))
+        new_row <- tibble::as_tibble(jsonlite::fromJSON(jsonlite::toJSON(out), flatten = TRUE)) |> normalize_cols()
+        .DB(bind_rows(new_row, db_now2))
+        new_idx <- tibble::tibble(
+          athlete   = as.character(out$athlete),
+          date      = as.character(out$date),
+          timestamp = as.character(out$timestamp %||% out$date)
+        )
+        .IDX(
+          dplyr::bind_rows(new_idx, safe_tibble(.IDX())) %>%
+            dplyr::distinct(athlete, date) %>%
+            dplyr::arrange(dplyr::desc(as.Date(as.character(date))))
+        )
         
-        proxy <- DT::dataTableProxy("recent_tbl")
-        DT::replaceData(proxy, df2, resetPaging = TRUE, rownames = FALSE)
-      }, silent = TRUE)
-      output$status <- renderText("Existing record overwritten and saved to database")
-      pending_row(NULL)
-    } else {
-      output$status <- renderText(paste("Overwrite failed:", res$message %||% "<no message>"))
-      cat("\n[replace_rows_for_key] RAW response:\n", res$raw %||% "<no raw>", "\n")
-    }
+        # refresh the “Last 10 entries” table
+        try({
+          df2 <- recent_from_cache() %>%
+            dplyr::select(date, athlete) %>%
+            dplyr::rename(Date = date, Athlete = athlete)
+          proxy <- DT::dataTableProxy("recent_tbl")
+          DT::replaceData(proxy, df2, resetPaging = TRUE, rownames = FALSE)
+        }, silent = TRUE)
+        
+        incProgress(1, detail = "Done")
+        output$status <- renderText("Existing record overwritten and saved to database")
+        pending_row(NULL)
+      } else {
+        incProgress(1, detail = "Failed")
+        output$status <- renderText("Error: could not overwrite existing record")
+      }
+    })
+    
+    shinyjs::enable("confirm_replace")
+    runjs("$('#confirm_replace').text('Overwrite existing record');")
   })
+  
   
   # ---------- Batch upload (.xlsx) ----------
   output$upload_status <- renderText("")
